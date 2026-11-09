@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=CodeCanvas
+Comment=Infinite canvas for source code
+Exec=codecanvas %f
+Terminal=false
+Categories=Development;TextEditor;
+MimeType=inode/directory;

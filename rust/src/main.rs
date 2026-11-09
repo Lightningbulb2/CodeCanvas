@@ -1,0 +1,77 @@
+//! CodeCanvas (GPUI). Usage: codecanvas [folder] [file]
+
+mod agent;
+mod diff;
+mod highlight;
+mod llm;
+mod model;
+mod settings;
+mod text;
+mod ui;
+mod web;
+
+use gpui::{App, Application, Bounds, WindowBounds, WindowOptions, prelude::*, px, size};
+use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::mpsc::{Sender, channel};
+
+const CHILD_FLAG: &str = "--cc-child";
+
+/// Zed tasks wait for their program, so the visible process relaunches itself detached and exits.
+fn relaunch_detached(args: &[String]) -> std::io::Result<()> {
+    let mut c = Command::new(std::env::current_exe()?);
+    c.args(args).arg(CHILD_FLAG).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    #[cfg(unix)]
+    { use std::os::unix::process::CommandExt; c.process_group(0); }
+    #[cfg(windows)]
+    { use std::os::windows::process::CommandExt; c.creation_flags(0x0000_0008 | 0x0000_0200); } // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    c.spawn().map(|_| ())
+}
+
+fn port_file(project: u64) -> PathBuf { model::runtime_dir().join(format!("{project:016x}.port")) }
+
+/// If this project is already open, ask that instance to show `file` and report true.
+fn hand_off(project: u64, file: Option<&Path>) -> bool {
+    let Ok(port) = std::fs::read_to_string(port_file(project)) else { return false };
+    let Ok(port) = port.trim().parse::<u16>() else { return false };
+    let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) else { return false };
+    writeln!(s, "{}", file.map(|f| f.display().to_string()).unwrap_or_default()).is_ok()
+}
+
+fn listen(project: u64, tx: Sender<String>) {
+    let Ok(l) = TcpListener::bind(("127.0.0.1", 0)) else { return };
+    let Ok(addr) = l.local_addr() else { return };
+    let file = port_file(project);
+    if let Some(d) = file.parent() { let _ = std::fs::create_dir_all(d); }
+    let _ = std::fs::write(file, addr.port().to_string());
+    std::thread::spawn(move || {
+        for s in l.incoming().flatten() {
+            let mut line = String::new();
+            if BufReader::new(s).read_line(&mut line).is_ok() { let _ = tx.send(line.trim().to_string()); }
+        }
+    });
+}
+
+fn main() {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if !argv.iter().any(|a| a == CHILD_FLAG) && relaunch_detached(&argv).is_ok() { return; }
+    let args: Vec<PathBuf> = argv.iter().filter(|a| !a.is_empty() && !a.starts_with("--")).map(PathBuf::from).collect();
+    let mut root = args.iter().find(|p| p.is_dir()).cloned();
+    let file = args.iter().find(|p| p.is_file()).cloned();
+    if root.is_none() { root = file.as_ref().and_then(|f| f.parent().map(PathBuf::from)).filter(|p| !p.as_os_str().is_empty()); }
+    let root = root.unwrap_or_else(|| std::env::current_dir().expect("no current directory"));
+    let id = model::Project::new(root.clone(), Vec::new()).expect("can't open the project folder").id();
+    if hand_off(id, file.as_deref()) { return; }
+    let (tx, rx) = channel();
+    listen(id, tx);
+
+    Application::new().run(move |cx: &mut App| {
+        let bounds = Bounds::centered(None, size(px(1500.), px(950.)), cx);
+        let opts = WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() };
+        cx.open_window(opts, |window, cx| cx.new(|cx| ui::CanvasView::new(root, file, rx, window, cx))).unwrap();
+        cx.on_window_closed(|cx| { if cx.windows().is_empty() { cx.quit(); } }).detach();
+        cx.activate(true);
+    });
+}

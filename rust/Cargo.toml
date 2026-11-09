@@ -1,0 +1,17 @@
+[package]
+name = "codecanvas"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "CodeCanvas: an infinite canvas for code, built on GPUI."
+
+[dependencies]
+gpui = "0.2.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+ureq = { version = "2", features = ["json"] }
+
+# gpui 0.2.2 pulls in xattr 0.2.3, which no longer builds on Linux against current libc.
+[patch.crates-io]
+xattr = { path = "patches/xattr" }
