@@ -560,7 +560,7 @@ impl CanvasView {
             let kbd = |k: &'static str| div().px(px(4.)).rounded(px(4.)).bg(col(PANEL)).border_1().border_b_2().border_color(col(PANEL_BORDER)).text_size(px(10.5)).child(k).into_any_element();
             let t = |s: &'static str| div().child(s).into_any_element();
             let parts = vec![kbd("Wheel"), t("scroll ·"), kbd("Shift"), t("+wheel sideways ·"), kbd("Ctrl"), t("+wheel zoom · middle-drag pan ·"), kbd("Space"), t("+drag moves any card ·"), kbd("Ctrl"), t("/"), kbd("Shift"), t("+click multi-select · right-click → Merge · double-click to edit ·"),
-                kbd("Shift"), t("+drag moves selected lines or a snippet inside its file ·"), kbd("Alt"), t("+drag a snippet for a reference ·"), kbd("Esc"), t("cancels a drag")];
+                kbd("Shift"), t("+drag moves selected lines, or grabs a snippet ·"), kbd("Alt"), t("+drag a snippet for a reference ·"), kbd("Esc"), t("cancels a drag")];
             out.push(div().absolute().left(px(ax + 12.)).bottom(px(10.)).max_w(px((aw - 24.).max(100.))).flex().flex_wrap().items_center().gap(px(4.)).px(px(8.)).py(px(4.)).bg(cola(PANEL, 0.85)).rounded(px(6.)).text_size(px(11.5)).text_color(col(MUTED)).children(parts).into_any_element());
         }
         if let Some(models) = self.models.clone() {

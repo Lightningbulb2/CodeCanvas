@@ -141,7 +141,7 @@ pub struct CanvasView {
     pub(crate) chat_open: bool,
     pub(crate) explorer_open: bool,
     pub(crate) hist_open: bool,
-    pub(crate) spans: HashMap<u64, (Vec<String>, Spans)>,
+    pub(crate) spans: HashMap<u64, (Vec<String>, Rc<Spans>)>,
     pub(crate) scrolls: HashMap<u64, ScrollHandle>,
     pub(crate) pending_bottom: HashSet<u64>,
     pub(crate) space: bool,
@@ -270,6 +270,13 @@ impl CanvasView {
     pub(crate) fn pv(&self, pane: u64) -> PaneView { self.views.get(&pane).copied().unwrap_or(self.views[&self.active]) }
     pub(crate) fn input(&mut self, k: Input) -> &mut TextBuffer { self.inputs.entry(k).or_default() }
     pub(crate) fn char_w(&self, z: f32) -> f32 { self.char_ratio * 12.5 * z }
+    /// Font size for code in a view. While a zoom is gliding it moves in quarter-pixel steps, so glyphs
+    /// are reused between frames instead of being rasterised afresh at every size on the way.
+    pub(crate) fn code_px(&self, pane: u64) -> f32 {
+        let p = self.pv(pane);
+        let s = 12.5 * p.v.z;
+        if (p.t.z - p.v.z).abs() > 1e-4 { ((s * 4.).round() / 4.).max(0.25) } else { s }
+    }
     pub(crate) fn scroll_handle(&mut self, id: u64) -> ScrollHandle { self.scrolls.entry(id).or_default().clone() }
 
     pub(crate) fn canvas_area(&self) -> (f32, f32, f32, f32) {
@@ -629,7 +636,7 @@ impl CanvasView {
                 cx.notify();
                 return;
             }
-            // Shift on a snippet's lines: a drag moves it inside this file; a click is the usual Shift+click, done on release.
+            // Shift on a snippet's lines: a drag grabs it (inside the file or out of it); a click is the usual Shift+click, done on release.
             let held = self.doc.regions_of(id).into_iter().filter(|r| line >= r.start && line <= r.end).min_by_key(|r| r.end - r.start);
             if let Some(r) = held { self.start_region(r.id, Via::Shift, e, pane, cx); return; }
         }
@@ -753,7 +760,7 @@ impl CanvasView {
             Drag::Resize { id, sx, ow, z } => { if let Some(c) = self.doc.card_mut(id) { c.w = (ow + (x - sx) / z).max(240.); } drag }
             Drag::Region { id, via, sx, sy, wx, wy, pane } => {
                 if self.live.is_none() {
-                    if (x - sx).hypot(y - sy) >= 5. { self.begin_region_live(id, pane, via == Via::Shift); }
+                    if (x - sx).hypot(y - sy) >= 5. { self.begin_region_live(id, pane); }
                 }
                 if let Some(mut l) = self.live.take() {
                     // a Shift drag stays in its own file and view: it only moves up and down
@@ -819,13 +826,13 @@ impl CanvasView {
         self.drag = Some(keep);
     }
 
-    fn begin_region_live(&mut self, id: u64, pane: u64, lock: bool) {
+    fn begin_region_live(&mut self, id: u64, pane: u64) {
         let Some(r) = self.doc.region(id).cloned() else { return };
         let Some(f) = self.doc.card(r.file).cloned() else { return };
         let lines = self.doc.region_lines(&r);
         self.clear_line_sel();
         self.fx.forget(Tw::Ghost);
-        self.live = Some(Live { n: lines.len(), src: Some((r.file, r.start, r.end)), region: Some(id), over: Some(r.file), at: r.start, ref_mode: false, lock, ghost_card: None, lines, lang: f.lang.clone(), title: r.title.clone(), color: r.color, gx: f.x, gy: f.y + HEAD + PAD + r.start as f32 * LH, gw: f.w, pane });
+        self.live = Some(Live { n: lines.len(), src: Some((r.file, r.start, r.end)), region: Some(id), over: Some(r.file), at: r.start, ref_mode: false, lock: false, ghost_card: None, lines, lang: f.lang.clone(), title: r.title.clone(), color: r.color, gx: f.x, gy: f.y + HEAD + PAD + r.start as f32 * LH, gw: f.w, pane });
     }
 
     /// `gx`/`gy` are the dragged block's card origin in world units; `py` is the pointer's world y.
@@ -1535,7 +1542,7 @@ impl CanvasView {
 
     pub(crate) fn set_spans(&mut self, id: u64, lines: &[String], lang: &str) {
         if self.spans.get(&id).is_some_and(|(l, _)| l == lines) { return; }
-        self.spans.insert(id, (lines.to_vec(), highlight(lines, lang)));
+        self.spans.insert(id, (lines.to_vec(), Rc::new(highlight(lines, lang))));
     }
 }
 

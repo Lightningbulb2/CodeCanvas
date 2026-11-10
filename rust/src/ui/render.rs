@@ -5,8 +5,8 @@ use super::panels::{tool, tool_with};
 use super::*;
 use crate::model::Card;
 use gpui::{
-    AnyElement, BorderStyle, Bounds, BoxShadow, Div, FontWeight, HighlightStyle, Hsla, MouseButton, PathBuilder, Render, SharedString, StyledText, Transformation, canvas, div, point,
-    prelude::*, quad, radians, rgb, size, transparent_black,
+    AnyElement, BorderStyle, Bounds, BoxShadow, Div, Font, FontWeight, HighlightStyle, Hsla, MouseButton, PathBuilder, Render, SharedString, StyledText, TextRun, Transformation, canvas, div,
+    fill, point, prelude::*, quad, radians, rgb, size, transparent_black,
 };
 
 pub(crate) const BG: u32 = 0x1b1d22;
@@ -54,6 +54,46 @@ pub(crate) fn display_line(line: &str, spans: Option<&Vec<(Range<usize>, Tok)>>)
     (line.replace('\t', "    ").into(), spans.into_iter().flatten().map(|(r, t)| (map(r.start)..map(r.end), style(*t))).collect())
 }
 
+/// One line of a card, ready to be painted straight onto the card (no layout elements per line).
+struct Row { y: f32, dx: f32, num: SharedString, text: SharedString, hl: Vec<(Range<usize>, HighlightStyle)>, bg: [Option<Hsla>; 2], alpha: f32, sel: Option<(f32, f32)>, caret: Option<f32> }
+
+/// Lines are shaped once at this size and painted at whatever size the zoom needs, so zooming never
+/// reshapes text: the shaped line is found in the cache every frame and only its glyphs are drawn.
+const SHAPE_PX: f32 = 12.5;
+
+/// The fonts of a line for shaping: comments in italics, everything else upright. Colours are applied when painting.
+fn text_runs(len: usize, hl: &[(Range<usize>, HighlightStyle)], base: &Font, italic: &Font) -> Vec<TextRun> {
+    let run = |n: usize, font: &Font| TextRun { len: n, font: font.clone(), color: col(FG), background_color: None, underline: None, strikethrough: None };
+    let (mut out, mut at) = (Vec::new(), 0);
+    for (r, _) in hl.iter().filter(|(_, st)| st.font_style.is_some()) {
+        if r.start < at || r.end > len || r.start >= r.end { continue; }
+        if r.start > at { out.push(run(r.start - at, base)); }
+        out.push(run(r.end - r.start, italic));
+        at = r.end;
+    }
+    if at < len { out.push(run(len - at, base)); }
+    out
+}
+
+/// Paints a line shaped at [`SHAPE_PX`] at `font_px`, colouring each glyph from the highlight ranges.
+#[allow(clippy::too_many_arguments)]
+fn paint_scaled(line: &gpui::LineLayout, hl: &[(Range<usize>, HighlightStyle)], plain: Hsla, alpha: f32, origin: gpui::Point<Pixels>, line_height: Pixels, font_px: f32, window: &mut Window, cx: &mut gpui::App) {
+    let k = font_px / SHAPE_PX;
+    let (ascent, descent) = (fl(line.ascent) * k, fl(line.descent) * k);
+    let baseline = origin.y + px((fl(line_height) - ascent - descent) / 2. + ascent);
+    let (mut h, size_px) = (0, px(font_px));
+    for run in &line.runs {
+        for g in &run.glyphs {
+            while h < hl.len() && g.index >= hl[h].0.end { h += 1; }
+            let mut color = hl.get(h).filter(|(r, _)| g.index >= r.start).and_then(|(_, st)| st.color).unwrap_or(plain);
+            color.a *= alpha;
+            let at = point(origin.x + px(fl(g.position.x) * k), baseline + px(fl(g.position.y) * k));
+            let _ = if g.is_emoji { window.paint_emoji(at, run.font_id, g.id, size_px) } else { window.paint_glyph(at, run.font_id, g.id, size_px, color) };
+        }
+    }
+    let _ = cx;
+}
+
 fn dir_and_base(path: &str) -> (&str, &str) { path.rfind('/').map_or(("", path), |i| path.split_at(i + 1)) }
 
 impl CanvasView {
@@ -86,8 +126,9 @@ impl CanvasView {
         let z = self.pv(pane).v.z;
         let id = card.id;
         let editing = self.editing == Some(id);
-        let lines: Vec<String> = if editing { self.inputs[&Input::Editor(id)].lines.clone() } else { card.lines.clone() };
-        self.set_spans(id, &lines, &card.lang);
+        let edited;
+        let lines: &[String] = if editing { edited = self.inputs[&Input::Editor(id)].lines.clone(); &edited } else { &card.lines };
+        self.set_spans(id, lines, &card.lang);
         let spans = self.spans[&id].1.clone();
         let live = self.live.take();
         let dragging = live.is_some();
@@ -97,7 +138,7 @@ impl CanvasView {
         let top_px = sy + HEAD * z;
         let first = (((-top_px) / lh).floor().max(0.) as usize).saturating_sub(40);
         let last = ((((vh - top_px) / lh).ceil().max(0.) as usize) + 40).min(lines.len());
-        let mut layer = div().absolute().left_0().top(px(HEAD * z)).w_full().bottom_0().overflow_hidden().font_family(mono()).text_size(px(12.5 * z)).line_height(px(lh))
+        let mut layer = div().absolute().left_0().top(px(HEAD * z)).w_full().bottom_0().overflow_hidden()
             .when(card.is_file() || editing, |d| d.cursor_text())
             .on_mouse_down(MouseButton::Left, cx.listener(move |t, e: &MouseDownEvent, _, cx| {
                 let is_file = t.doc.card(id).is_some_and(Card::is_file);
@@ -112,7 +153,8 @@ impl CanvasView {
             layer = layer.child(div().absolute().left_0().w_full().top(px(y)).h(px((b - a + 1) as f32 * lh)).bg(cola(SEL, 0.55)).border_l(px((3. * z).max(1.))).border_color(col(ACCENT)));
         }
         let caret = editing.then(|| self.inputs[&Input::Editor(id)].clone());
-        let num_color = cola(MUTED, 0.7);
+        let mut rows: Vec<Row> = Vec::with_capacity(last.saturating_sub(first));
+        let cw = self.char_w(z);
         for i in first..last {
             let lifted = live.as_ref().is_some_and(|l| l.src.is_some_and(|s| s.0 == id && !l.ref_mode && i >= s.1 && i <= s.2));
             if lifted { continue; }
@@ -122,29 +164,38 @@ impl CanvasView {
             if alpha <= 0.01 { continue; }
             let (flash, dx) = (self.fx.flash(id, i), self.fx.dx(id, i));
             let (text, hl) = display_line(&lines[i], spans.get(i));
-            let y = (PAD + i as f32 * LH + off) * z;
-            let num = (start_no as isize + i as isize + shift).to_string();
-            let mut row = div().absolute().left(px(dx * z)).w_full().top(px(y)).h(px(lh)).flex()
-                .when(opaque, |d| d.bg(col(CARD)))
-                .when(flash > 0., |d| d.bg(cola(OK, flash)))
-                .when(alpha < 1., |d| d.opacity(alpha))
-                .child(div().w(px(gutter)).flex_none().flex().justify_end().pr(px(12. * z)).text_color(num_color).child(num))
-                .child(div().flex_1().relative().text_color(col(FG)).whitespace_nowrap().overflow_hidden().child(StyledText::new(text).with_highlights(hl)));
+            let mut row = Row { y: (PAD + i as f32 * LH + off) * z, dx: dx * z, num: (start_no as isize + i as isize + shift).to_string().into(), text, hl,
+                bg: [opaque.then(|| col(CARD)), (flash > 0.).then(|| cola(OK, flash))], alpha, sel: None, caret: None };
             if let Some(b) = &caret {
-                let cw = self.char_w(z);
                 if let Some((a, e)) = b.selection() {
                     if i >= a.line && i <= e.line {
                         let from = if i == a.line { crate::ui::visual_len(&lines[i][..a.col]) } else { 0 };
                         let to = if i == e.line { crate::ui::visual_len(&lines[i][..e.col]) } else { crate::ui::visual_len(&lines[i]) + 1 };
-                        row = row.child(div().absolute().left(px(gutter + from as f32 * cw)).top_0().h_full().w(px((to - from) as f32 * cw)).bg(cola(SEL, 0.6)));
+                        row.sel = Some((gutter + from as f32 * cw, (to - from) as f32 * cw));
                     }
                 }
-                if b.cur.line == i {
-                    row = row.child(div().absolute().left(px(gutter + crate::ui::visual_len(&lines[i][..b.cur.col]) as f32 * cw)).top_0().h_full().w(px((1.5 * z).max(1.))).bg(col(WARN)));
-                }
+                if b.cur.line == i { row.caret = Some(gutter + crate::ui::visual_len(&lines[i][..b.cur.col]) as f32 * cw); }
             }
-            layer = layer.child(row);
+            rows.push(row);
         }
+        let font_px = self.code_px(pane);
+        let (num_right, caret_w) = (gutter - 12. * z, (1.5 * z).max(1.));
+        layer = layer.child(canvas(|_, _, _| (), move |b: Bounds<Pixels>, _, window, cx| {
+            let base = font(mono());
+            let italic = base.clone().italic();
+            let ts = window.text_system().clone();
+            let lh = px(lh);
+            for r in rows {
+                let origin = point(b.origin.x + px(r.dx), b.origin.y + px(r.y));
+                for bg in r.bg.into_iter().flatten() { window.paint_quad(fill(Bounds::new(origin, size(b.size.width, lh)), bg)); }
+                if let Some((x, w)) = r.sel { window.paint_quad(fill(Bounds::new(point(origin.x + px(x), origin.y), size(px(w), lh)), cola(SEL, 0.6))); }
+                let num = ts.layout_line(&r.num, px(SHAPE_PX), &text_runs(r.num.len(), &[], &base, &base), None);
+                paint_scaled(&num, &[], cola(MUTED, 0.7 * r.alpha), 1., point(origin.x + px(num_right - fl(num.width) * font_px / SHAPE_PX), origin.y), lh, font_px, window, cx);
+                let code = ts.layout_line(&r.text, px(SHAPE_PX), &text_runs(r.text.len(), &r.hl, &base, &italic), None);
+                paint_scaled(&code, &r.hl, col(FG), r.alpha, point(origin.x + px(gutter), origin.y), lh, font_px, window, cx);
+                if let Some(x) = r.caret { window.paint_quad(fill(Bounds::new(point(origin.x + px(x), origin.y), size(px(caret_w), lh)), col(WARN))); }
+            }
+        }).absolute().size_full());
         self.live = live;
         layer
     }
@@ -272,8 +323,18 @@ impl CanvasView {
         let moving: Vec<u64> = match &self.drag { Some(Drag::Move { items, moved: true, .. }) => items.iter().map(|i| i.id).collect(), _ => Vec::new() };
         let mut out: Vec<AnyElement> = Vec::new();
         let mut drawers: Vec<AnyElement> = Vec::new(); // tabs and chats always sit above every card
-        let order: Vec<Card> = self.doc.cards.iter().filter(|c| self.in_pane(c, pane)).cloned().collect();
-        for c in &order {
+        for i in 0..self.doc.cards.len() {
+            // Decide from the card's frame whether it is on screen before copying any of its text.
+            let src = &self.doc.cards[i];
+            if !self.in_pane(src, pane) { continue; }
+            let n_lines = src.lines.len();
+            let roomy = n_lines + self.live.as_ref().map_or(0, |l| l.n) + 8;
+            let (rx, ry, rh) = (src.x * z + v.x, src.y * z + v.y, (HEAD + PAD * 2. + roomy as f32 * LH) * z);
+            let settled = !self.fx.slides.contains_key(&src.id) && self.editing != Some(src.id);
+            if settled && (ry > vh + 2100. * z || ry + rh < -700. || rx > vw + 1000. || rx + src.w * z + 1000. * z < 0.) { continue; }
+            let c = &if z < FAR_Z {
+                Card { id: src.id, path: src.path.clone(), title: src.title.clone(), lang: String::new(), pane: src.pane, x: src.x, y: src.y, w: src.w, lines: Vec::new(), disk: Vec::new(), color: src.color, talk: Talk::default(), ref_of: src.ref_of, target: None, sel: None }
+            } else { src.clone() };
             if ghost_card == Some(c.id) && over.is_some() { continue; } // drawn inside its slot
             let (alpha, rise) = self.fx.card(c.id);
             if alpha <= 0. { continue; } // its lines are still flying in
@@ -283,7 +344,7 @@ impl CanvasView {
                 ((if gap { l.n as isize } else { 0 }) - (if lifted { l.n as isize } else { 0 }), if gap { 2. * GP } else { 0. })
             });
             let editing_n = (self.editing == Some(c.id)).then(|| self.inputs[&Input::Editor(c.id)].lines.len());
-            let n = (editing_n.unwrap_or(c.lines.len()) as isize + live_n).max(1) as f32;
+            let n = (editing_n.unwrap_or(n_lines) as isize + live_n).max(1) as f32;
             let h_world = (HEAD + PAD * 2. + n * LH + extra + self.fx.extra(c.id)).max(HEAD + PAD * 2.);
             let slide = self.fx.slide(c.id);
             // an undocked card being dragged eases back from the slot it just left
@@ -296,7 +357,7 @@ impl CanvasView {
             if z < FAR_Z {
                 let (dir, base) = dir_and_base(&c.title);
                 let name = if c.ref_of.is_some() { format!("↗ {}", c.title) } else { base.to_string() };
-                let small = if c.is_file() { format!("{dir} · {} lines", c.lines.len()) } else { format!("{} lines", c.lines.len()) };
+                let small = if c.is_file() { format!("{dir} · {n_lines} lines") } else { format!("{n_lines} lines") };
                 out.push(self.card_box(sx, sy, sw, sh, z, border).bg(cola(CARD, 0.92)).flex().flex_col().items_center().justify_center().gap(px(2.)).px(px(6.))
                     .child(div().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).text_color(col(if c.is_file() { FG } else { c.color })).whitespace_nowrap().child(name))
                     .when(sh > 44., |d| d.child(div().text_size(px(11.)).text_color(col(MUTED)).whitespace_nowrap().child(small))).into_any_element());
