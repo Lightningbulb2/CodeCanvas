@@ -1671,31 +1671,41 @@ function makeGhost(s, f) {
 
 /**
  * Drag an anchored snippet: up/down inside its file, into another file (any pane), or out onto the canvas.
- * Alt = reference (on canvas) / copy (into a file). `via`: 'tab' | 'bar' | 'lines'.
+ * Alt = reference (on canvas) / copy (into a file). `via`: 'tab' | 'bar' | 'lines' | 'shift'.
+ * 'shift' (Shift+drag on the snippet's lines) keeps it inside its own file: it only moves up and down,
+ * and the wheel scrolls vertically meanwhile. Released without dragging, it is a plain Shift+click.
  */
 function startRegionDrag(e, s, via) {
   const f = S.files.get(s.fileId);
   if (!f) return;
   const P0 = paneOf(f);
   const p0 = toWorld(e.clientX, e.clientY, P0);
+  const lock = via === 'shift';
   let g = null;
   if (via === 'bar') { S.hl = null; select([s.id]); }
-  drag = { kind: 'region', cancel: () => { if (!g) return; g.el.remove(); finishLive(); if (S.shared) makeHost(P0); setActive(P0); } };
+  drag = { kind: lock ? 'shiftlines' : 'region', cancel: () => { if (!g) return; g.el.remove(); finishLive(); if (S.shared) makeHost(P0); setActive(P0); } };
   drag.refresh = () => g && lastPointer && regionMove(lastPointer);
   const regionMove = ev => {
-    const P = paneAt(ev.clientX, ev.clientY) || g?.P || P0;
+    const P = lock ? P0 : paneAt(ev.clientX, ev.clientY) || g?.P || P0;
     const p = toWorld(ev.clientX, ev.clientY, P);
     if (!g) {
       if (Math.hypot(ev.clientX - e.clientX, ev.clientY - e.clientY) < 5 || S.animating || S.editing || live) return;
       hideSelTools();
+      clearAllSel();
       g = makeGhost(s, f);
-      live = { n: s.end - s.start + 1, src: { f, start: s.start, end: s.end }, region: s, ghost: g.el, refMode: false, over: f, at: s.start, pad: true, files: new Set(), tops: new Map() };
+      live = { n: s.end - s.start + 1, src: { f, start: s.start, end: s.end }, region: s, ghost: g.el, refMode: false, over: f, at: s.start, pad: true, lock: lock ? f : null, files: new Set(), tops: new Map() };
       prepLive(f);
       layoutLive(f);
       f.el.style.zIndex = String(S.zTop += 2); g.el.style.zIndex = String(S.zTop - 1);
       g.dx = p0.x - g.x; g.dy = p0.y - g.y; // anchor to where the mouse went down (world units)
     }
     if (P !== g.P) { g.P = P; if (S.shared) makeHost(P); else P.world.append(g.el); setActive(P); }
+    if (lock) {                  // vertical only: the snippet stays in its file's column
+      g.y = p.y - g.dy;
+      g.el.style.top = g.y + 'px';
+      liveHover({ x: f.x + 10, y: p.y }, g.y + g.linesOff, false, P, g.y);
+      return;
+    }
     g.x = p.x - g.dx; g.y = p.y - g.dy;
     g.el.style.left = g.x + 'px'; g.el.style.top = g.y + 'px';
     setRefMode(ev.altKey);
@@ -1705,6 +1715,7 @@ function startRegionDrag(e, s, via) {
   drag.abort = capture(e, regionMove, async () => {
     if (!g) {
       if (via === 'tab') toggleDrawer(s);
+      else if (lock) toggleSelect(f.id); // Shift+click: the selection changes on release, never on a drag
       // a plain click on a selected snippet keeps it selected and highlights it
       else if (via === 'lines' || via === 'bar') { S.hl = s.id; paintSelection(); }
       return;
@@ -2169,6 +2180,12 @@ function selectedRegionAt(f, clientY) {
   return regionsOf(f).filter(s => S.selected.has(s.id) && line >= s.start && line <= s.end).sort((a, b) => (a.end - a.start) - (b.end - b.start))[0];
 }
 
+/** The innermost snippet region under the pointer, selected or not (Shift+drag grabs it). */
+function regionAt(f, clientY) {
+  const line = lineAt(f, clientY);
+  return regionsOf(f).filter(s => line >= s.start && line <= s.end).sort((a, b) => (a.end - a.start) - (b.end - b.start))[0];
+}
+
 /** A press that arrives while a drop is still sliding into place is replayed once the drop settles. */
 let pendingPress = null;
 function replayPendingPress() {
@@ -2233,6 +2250,10 @@ function onPointerDown(e, P) {
     if (e.shiftKey && sr) {
       const line = lineAt(card, e.clientY);
       if (line >= sr.a && line <= sr.b) { startShiftLineDrag(e, card, sr); return; }
+    }
+    if (e.shiftKey) {
+      const held = regionAt(card, e.clientY);
+      if (held) { startRegionDrag(e, held, 'shift'); return; }
     }
     if (mod) { toggleSelect(card.id); return; }
     const reg = selectedRegionAt(card, e.clientY);
