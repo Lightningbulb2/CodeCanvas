@@ -1,5 +1,6 @@
 //! The CodeCanvas view: state, views/panes, pointer and keyboard handling, LLM plumbing.
 
+pub mod fx;
 mod panels;
 mod render;
 
@@ -10,6 +11,7 @@ use crate::model::*;
 use crate::settings::Settings;
 use crate::text::TextBuffer;
 use crate::web::WebTools;
+use fx::{Fade, Fly, Fx, LineKind, Tw, later};
 use gpui::{
     ClipboardItem, Context, FocusHandle, KeyDownEvent, KeyUpEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollHandle, ScrollWheelEvent, Window, font, px,
 };
@@ -53,7 +55,7 @@ pub(crate) struct MoveItem { id: u64, dx: f32, dy: f32, ox: f32, oy: f32, pane: 
 
 pub(crate) enum Drag {
     Pan { pane: u64, sx: f32, sy: f32, ox: f32, oy: f32 },
-    Marquee { pane: u64, sx: f32, sy: f32, cx: f32, cy: f32, base: HashSet<u64> },
+    Marquee { pane: u64, sx: f32, sy: f32, cx: f32, cy: f32, base: HashSet<u64>, moved: bool },
     Move { items: Vec<MoveItem>, sx: f32, sy: f32, moved: bool, single: Option<u64> },
     Select { id: u64 },
     EditSelect { id: u64 },
@@ -66,7 +68,7 @@ pub(crate) enum Drag {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub(crate) enum Via { Tab, Bar, Lines }
+pub(crate) enum Via { Tab, Bar, Lines, Shift }
 
 /// A block being dragged over files: lines part around it in real time.
 pub(crate) struct Live {
@@ -101,8 +103,9 @@ pub(crate) enum Ev {
 }
 
 pub(crate) struct MenuItem { pub label: String, pub act: Option<Act> }
-pub(crate) struct Menu { pub x: f32, pub y: f32, pub items: Vec<MenuItem> }
-pub(crate) struct Pick { pub snippets: Vec<u64>, pub file: Option<u64>, pub over: Option<(u64, usize)> }
+pub(crate) struct Menu { pub x: f32, pub y: f32, pub items: Vec<MenuItem>, pub at: Instant }
+/// `over` is (file, line, lines it would replace).
+pub(crate) struct Pick { pub snippets: Vec<u64>, pub file: Option<u64>, pub over: Option<(u64, usize, usize)> }
 
 pub struct CanvasView {
     pub(crate) project: Arc<Project>,
@@ -145,6 +148,11 @@ pub struct CanvasView {
     pub(crate) toasts: Vec<(String, bool, Instant)>,
     pub(crate) char_ratio: f32,
     pub(crate) anim: HashMap<(u64, usize), f32>,
+    pub(crate) fx: Fx,
+    /// Current widths of the explorer and the global chat (they slide open and shut).
+    pub(crate) side: (f32, f32),
+    pub(crate) sel_at: Instant,
+    pub(crate) started: Instant,
     pub(crate) focus: FocusHandle,
     pub(crate) win_size: (f32, f32),
     pub(crate) mouse: (f32, f32),
@@ -231,7 +239,7 @@ impl CanvasView {
             drag: None, live: None, selected: HashSet::new(), picked: None, hover_tab: None, doomed: Vec::new(), undo: Vec::new(), redo: Vec::new(),
             inputs: HashMap::new(), focus_input: None, editing: None, busy: HashMap::new(), tx, rx, explaining: HashMap::new(), explain_queue: None, menu: None, pick: None,
             models: None, show_settings: false, show_help: false, expanded: HashSet::new(), chat_open: true, explorer_open: true, hist_open: true, spans: HashMap::new(), scrolls: HashMap::new(),
-            pending_bottom: HashSet::new(), space: false, toasts: Vec::new(), char_ratio, anim: HashMap::new(), focus, win_size: (1500., 950.), mouse: (0., 0.), mods: Default::default(),
+            pending_bottom: HashSet::new(), space: false, toasts: Vec::new(), char_ratio, anim: HashMap::new(), fx: Fx::default(), side: (EXPLORER_W, CHAT_W), sel_at: Instant::now(), started: Instant::now(), focus, win_size: (1500., 950.), mouse: (0., 0.), mods: Default::default(),
             state_dirty: None, mtimes: HashMap::new(), last_poll: Instant::now(), inbox,
         };
         if let Some(s) = this.project.load_state() {
@@ -265,8 +273,7 @@ impl CanvasView {
     pub(crate) fn scroll_handle(&mut self, id: u64) -> ScrollHandle { self.scrolls.entry(id).or_default().clone() }
 
     pub(crate) fn canvas_area(&self) -> (f32, f32, f32, f32) {
-        let l = if self.explorer_open { EXPLORER_W } else { 0. };
-        let r = if self.chat_open { CHAT_W } else { 0. };
+        let (l, r) = self.side;
         (l, TOP, (self.win_size.0 - l - r).max(50.), (self.win_size.1 - TOP).max(50.))
     }
 
@@ -410,23 +417,24 @@ impl CanvasView {
     }
 
     // ---------- view stepping ----------
-    pub(crate) fn step(&mut self, window: &mut Window) {
+    pub(crate) fn step(&mut self) {
         let mut moved = false;
+        let (kz, kp) = (self.fx.step(0.22), self.fx.step(0.3));
         for p in self.views.values_mut() {
             let (t, a) = (p.t, p.anchor);
             let v = &mut p.v;
             if (t.z - v.z).abs() > 1e-4 {
-                let nz = if (t.z / v.z - 1.).abs() < 0.002 { t.z } else { v.z * (t.z / v.z).powf(0.22) };
+                let nz = if (t.z / v.z - 1.).abs() < 0.002 { t.z } else { v.z * (t.z / v.z).powf(kz) };
                 let r = nz / v.z;
                 v.x = a.0 - (a.0 - v.x) * r; v.y = a.1 - (a.1 - v.y) * r; v.z = nz;
                 moved = true;
             }
             let dx = a.0 - ((a.0 - t.x) / t.z) * v.z;
             let dy = a.1 - ((a.1 - t.y) / t.z) * v.z;
-            if (dx - v.x).abs() > 0.3 || (dy - v.y).abs() > 0.3 { v.x += (dx - v.x) * 0.3; v.y += (dy - v.y) * 0.3; moved = true; } else { v.x = dx; v.y = dy; }
+            if (dx - v.x).abs() > 0.3 || (dy - v.y).abs() > 0.3 { v.x += (dx - v.x) * kp; v.y += (dy - v.y) * kp; moved = true; } else { v.x = dx; v.y = dy; }
         }
         if moved {
-            window.request_animation_frame();
+            self.fx.want_frame = true;
             self.touch();
             if self.drag.is_some() { let (x, y) = self.mouse; let m = self.mods; self.pointer_moved(x, y, m); }
         }
@@ -438,7 +446,7 @@ impl CanvasView {
         let d = e.delta.pixel_delta(px(LH));
         let (dx, dy) = (fl(d.x), fl(d.y));
         let r = self.rect_of(pane);
-        let shift_lines = matches!(self.drag, Some(Drag::ShiftLines { .. }));
+        let shift_lines = matches!(self.drag, Some(Drag::ShiftLines { .. })) || self.live.as_ref().is_some_and(|l| l.lock);
         let p = self.views.get_mut(&pane).unwrap();
         if e.modifiers.control || e.modifiers.platform {
             p.anchor = (fl(e.position.x) - r.x, fl(e.position.y) - r.y);
@@ -556,7 +564,7 @@ impl CanvasView {
             let keep = e.modifiers.control || e.modifiers.shift;
             let base = if keep { self.selected.clone() } else { HashSet::new() };
             if !keep { self.selected.clear(); self.picked = None; }
-            self.drag = Some(Drag::Marquee { pane, sx, sy, cx: sx, cy: sy, base });
+            self.drag = Some(Drag::Marquee { pane, sx, sy, cx: sx, cy: sy, base, moved: false });
         }
         cx.notify();
     }
@@ -621,6 +629,9 @@ impl CanvasView {
                 cx.notify();
                 return;
             }
+            // Shift on a snippet's lines: a drag moves it inside this file; a click is the usual Shift+click, done on release.
+            let held = self.doc.regions_of(id).into_iter().filter(|r| line >= r.start && line <= r.end).min_by_key(|r| r.end - r.start);
+            if let Some(r) = held { self.start_region(r.id, Via::Shift, e, pane, cx); return; }
         }
         if e.modifiers.control || e.modifiers.shift {
             if !self.selected.remove(&id) { self.selected.insert(id); }
@@ -670,12 +681,11 @@ impl CanvasView {
         self.mouse = (x, y);
         self.mods = e.modifiers;
         if let Some(p) = &self.pick {
-            let (file, _) = (p.file, ());
+            let file = p.file;
             let over = self.pane_at(x, y).and_then(|r| {
                 let (wx, wy) = self.to_world(r.id, x, y);
                 let f = self.file_under(r.id, wx, wy).filter(|f| file.is_none_or(|t| t == *f))?;
-                let c = self.doc.card(f)?;
-                Some((f, (((wy - c.y - HEAD - PAD) / LH).round().max(0.) as usize).min(c.lines.len())))
+                self.pick_spot(f, wy, &p.snippets)
             });
             self.pick.as_mut().unwrap().over = over;
             cx.notify();
@@ -692,6 +702,7 @@ impl CanvasView {
                 p.t = p.v; p.anchor = (0., 0.);
                 drag
             }
+            Drag::Marquee { pane, sx, sy, ref base, moved, .. } if !moved && (x - sx).hypot(y - sy) < 4. => Drag::Marquee { pane, sx, sy, cx: x, cy: y, base: base.clone(), moved },
             Drag::Marquee { pane, sx, sy, ref base, .. } => {
                 let (a, b) = (self.to_world(pane, sx.min(x), sy.min(y)), self.to_world(pane, sx.max(x), sy.max(y)));
                 let mut sel = base.clone();
@@ -699,13 +710,14 @@ impl CanvasView {
                     if c.x < b.0 && c.x + c.w > a.0 && c.y < b.1 && c.y + self.card_height(c) > a.1 { sel.insert(c.id); }
                 }
                 self.selected = sel;
-                Drag::Marquee { pane, sx, sy, cx: x, cy: y, base: base.clone() }
+                Drag::Marquee { pane, sx, sy, cx: x, cy: y, base: base.clone(), moved: true }
             }
             Drag::Move { items, sx, sy, mut moved, single } => {
                 if !moved && (x - sx).hypot(y - sy) < 3. { Drag::Move { items, sx, sy, moved, single } }
                 else {
                     if !moved && single.is_some() && self.live.is_none() {
                         let c = self.doc.card(single.unwrap()).unwrap();
+                        self.fx.forget(Tw::Ghost);
                         self.live = Some(Live { n: c.lines.len(), src: None, region: None, over: None, at: 0, ref_mode: false, lock: false, ghost_card: Some(c.id), lines: c.lines.clone(), lang: c.lang.clone(), title: c.title.clone(), color: c.color, gx: c.x, gy: c.y, gw: c.w, pane: c.pane });
                     }
                     moved = true;
@@ -741,20 +753,21 @@ impl CanvasView {
             Drag::Resize { id, sx, ow, z } => { if let Some(c) = self.doc.card_mut(id) { c.w = (ow + (x - sx) / z).max(240.); } drag }
             Drag::Region { id, via, sx, sy, wx, wy, pane } => {
                 if self.live.is_none() {
-                    if (x - sx).hypot(y - sy) >= 5. { self.begin_region_live(id, pane); }
+                    if (x - sx).hypot(y - sy) >= 5. { self.begin_region_live(id, pane, via == Via::Shift); }
                 }
                 if let Some(mut l) = self.live.take() {
-                    let p = self.pane_at(x, y).map_or(l.pane, |r| r.id);
+                    // a Shift drag stays in its own file and view: it only moves up and down
+                    let p = if l.lock { pane } else { self.pane_at(x, y).map_or(l.pane, |r| r.id) };
                     let (px_, py) = self.to_world(p, x, y);
                     if l.gw == 0. { l.gw = 400.; }
-                    let (origin_x, origin_y) = (l.gx, l.gy);
-                    let _ = (origin_x, origin_y);
                     if let Some(f) = l.src.and_then(|s| self.doc.card(s.0)) {
                         let top = f.y + HEAD + PAD + l.src.unwrap().1 as f32 * LH;
-                        l.gx = f.x + (px_ - wx); l.gy = top + (py - wy);
+                        l.gx = if l.lock { f.x } else { f.x + (px_ - wx) };
+                        l.gy = top + (py - wy);
                     }
                     l.pane = p;
-                    if l.ref_mode != m.alt { l.ref_mode = m.alt; l.over = None; }
+                    let alt = m.alt && !l.lock;
+                    if l.ref_mode != alt { l.ref_mode = alt; l.over = None; }
                     self.live = Some(l);
                     let (gx, gy) = { let l = self.live.as_ref().unwrap(); (l.gx, l.gy - HEAD - PAD) };
                     self.live_hover(p, gx, gy, py, false);
@@ -779,6 +792,7 @@ impl CanvasView {
             Drag::ShiftLines { id, a, b, sy, wy, pane } => {
                 if self.live.is_none() && (y - sy).abs() >= 4. {
                     let c = self.doc.card(id).unwrap().clone();
+                    self.fx.forget(Tw::Ghost);
                     self.live = Some(Live { n: b - a + 1, src: Some((id, a, b)), region: None, over: Some(id), at: a, ref_mode: false, lock: true, ghost_card: None, lines: c.lines[a..=b].to_vec(), lang: c.lang.clone(), title: String::new(), color: 0x4c9aff, gx: c.x, gy: c.y + HEAD + PAD + a as f32 * LH, gw: c.w, pane });
                     self.doc.card_mut(id).unwrap().sel = None;
                 }
@@ -805,11 +819,13 @@ impl CanvasView {
         self.drag = Some(keep);
     }
 
-    fn begin_region_live(&mut self, id: u64, pane: u64) {
+    fn begin_region_live(&mut self, id: u64, pane: u64, lock: bool) {
         let Some(r) = self.doc.region(id).cloned() else { return };
         let Some(f) = self.doc.card(r.file).cloned() else { return };
         let lines = self.doc.region_lines(&r);
-        self.live = Some(Live { n: lines.len(), src: Some((r.file, r.start, r.end)), region: Some(id), over: Some(r.file), at: r.start, ref_mode: false, lock: false, ghost_card: None, lines, lang: f.lang.clone(), title: r.title.clone(), color: r.color, gx: f.x, gy: f.y + HEAD + PAD + r.start as f32 * LH, gw: f.w, pane });
+        self.clear_line_sel();
+        self.fx.forget(Tw::Ghost);
+        self.live = Some(Live { n: lines.len(), src: Some((r.file, r.start, r.end)), region: Some(id), over: Some(r.file), at: r.start, ref_mode: false, lock, ghost_card: None, lines, lang: f.lang.clone(), title: r.title.clone(), color: r.color, gx: f.x, gy: f.y + HEAD + PAD + r.start as f32 * LH, gw: f.w, pane });
     }
 
     /// `gx`/`gy` are the dragged block's card origin in world units; `py` is the pointer's world y.
@@ -841,7 +857,7 @@ impl CanvasView {
                             let cur = { let c = self.doc.card_mut(id).unwrap(); let cur = (c.x, c.y, c.pane); c.x = it.ox; c.y = it.oy; c.pane = it.pane; cur };
                             self.snapshot();
                             let c = self.doc.card_mut(id).unwrap(); c.x = cur.0; c.y = cur.1; c.pane = cur.2;
-                            self.doc.merge(id, f, l.at, 0);
+                            if self.doc.merge(id, f, l.at, 0) { self.landed(f, l.at, l.n, cur.0, id); }
                             self.selected = HashSet::from([id]);
                             self.picked = None;
                         }
@@ -853,8 +869,10 @@ impl CanvasView {
                 None => match via {
                     Via::Tab => self.toggle_chat(id),
                     Via::Lines | Via::Bar => { self.selected = HashSet::from([id]); self.picked = Some(id); }
+                    // Shift+click: the selection changes on release, never on a drag
+                    Via::Shift => if let Some(f) = self.doc.region(id).map(|r| r.file) { if !self.selected.remove(&f) { self.selected.insert(f); } },
                 },
-                Some(l) => self.drop_region(id, l, alt),
+                Some(l) => { let alt = alt && !l.lock; self.drop_region(id, l, alt) }
             },
             Drag::Edge { id, moved, orig, .. } => {
                 let victims = std::mem::take(&mut self.doomed);
@@ -871,7 +889,9 @@ impl CanvasView {
                 Some(l) => {
                     let n = b - a + 1;
                     if l.at != a { self.snapshot(); self.doc.move_lines(id, a, b, l.at); }
+                    self.fx.line(id, l.at, n, LineKind::Settle, 0.);
                     self.doc.card_mut(id).unwrap().sel = Some((l.at, l.at + n - 1));
+                    self.sel_at = Instant::now();
                 }
             },
             Drag::Explorer { path, moved, .. } => {
@@ -884,11 +904,21 @@ impl CanvasView {
                     }
                 }
             }
+            Drag::Select { .. } => self.sel_at = Instant::now(),
             _ => {}
         }
         self.anim.clear();
+        self.fx.forget(Tw::Ghost);
         self.touch();
         cx.notify();
+    }
+
+    /// A dragged block was dropped into `file` at `at`: its breathing room closes and its tabs fade in.
+    fn landed(&mut self, file: u64, at: usize, n: usize, gx: f32, region: u64) {
+        let dx = self.doc.card(file).map_or(0., |f| gx - f.x);
+        self.fx.line(file, at, n, LineKind::Settle, 0.);
+        if let Some(l) = self.fx.lines.last_mut() { l.dx = dx; }
+        self.fx.fresh.insert(region, Instant::now());
     }
 
     fn drop_region(&mut self, id: u64, l: Live, alt: bool) {
@@ -898,10 +928,14 @@ impl CanvasView {
                 self.snapshot();
                 self.doc.splice(f, l.at, 0, l.lines.clone());
                 let c = self.doc.create_region(f, l.at, l.at + l.n - 1, Some(r.title), false, vec![]);
+                self.landed(f, l.at, l.n, l.gx, c);
                 self.selected = HashSet::from([c]);
             }
             (Some(f), false) => {
-                if !(f == r.file && l.at == r.start) { self.snapshot(); self.doc.move_region(id, f, l.at); }
+                let stayed = f == r.file && l.at == r.start;
+                if !stayed { self.snapshot(); self.doc.move_region(id, f, l.at); }
+                self.landed(f, l.at, l.n, l.gx, id);
+                if stayed { self.fx.fresh.remove(&id); }
                 self.selected = HashSet::from([id]);
             }
             (None, true) => { self.snapshot(); self.doc.make_reference(id, l.gx, l.gy - HEAD - PAD, l.pane); }
@@ -922,14 +956,101 @@ impl CanvasView {
 
     fn finish_pick(&mut self, _pane: u64, _sx: f32, _sy: f32) -> bool {
         let Some(p) = self.pick.take() else { return false };
-        if let Some((f, at)) = p.over {
+        if let Some((f, at, del)) = p.over {
             self.snapshot();
             let mut list = p.snippets;
+            // bottom-most first at the same point, so they end up in top-to-bottom order
             list.sort_by(|a, b| { let y = |i: &u64| self.doc.card(*i).map_or(0., |c| c.y); y(b).partial_cmp(&y(a)).unwrap() });
-            for s in list { self.doc.merge(s, f, at, 0); }
+            for (i, s) in list.into_iter().enumerate() { self.merge_fx(s, f, at, if i == 0 { del } else { 0 }); }
+            self.clear_line_sel();
             self.touch();
         }
         true
+    }
+
+    /// Where a picked snippet would land in `file` with the pointer at world y `wy`: (line, lines replaced).
+    /// Over the file's line selection, or over the range the LLM suggested for a single snippet, it replaces.
+    fn pick_spot(&self, file: u64, wy: f32, snippets: &[u64]) -> Option<(u64, usize, usize)> {
+        let c = self.doc.card(file)?;
+        let pos = (wy - c.y - HEAD - PAD) / LH;
+        let line = (pos.floor().max(0.) as usize).min(c.lines.len().saturating_sub(1));
+        let mut rep = c.sel_range().filter(|(a, b)| line >= *a && line <= *b);
+        if rep.is_none() && snippets.len() == 1 {
+            let target = self.doc.card(snippets[0]).and_then(|s| s.target.as_ref()).filter(|t| Some(&t.file) == c.path.as_ref()).and_then(|t| t.replace);
+            if let Some((a, b)) = target {
+                let (a, b) = (a.saturating_sub(1).min(c.lines.len() - 1), b.saturating_sub(1).min(c.lines.len() - 1));
+                if line + 1 >= a && line <= b + 1 && b >= a { rep = Some((a, b)); }
+            }
+        }
+        Some(match rep { Some((a, b)) => (file, a, b - a + 1), None => (file, (pos.round().max(0.) as usize).min(c.lines.len()), 0) })
+    }
+
+    // ---------- moves that are shown as lines flying between cards ----------
+    fn code_origin(&self, c: &Card, line: usize) -> (f32, f32) { (c.x + self.gutter(c.lines.len()), c.y + HEAD + PAD + line as f32 * LH) }
+
+    /// Sends copies of `lines` flying from one spot to another; returns how long the flight takes (ms).
+    fn fly(&mut self, pane: u64, lines: &[String], lang: &str, from: (f32, f32), to: (f32, f32), color: u32) -> f32 {
+        let lines = &lines[..lines.len().min(140)];
+        let hl = highlight(lines, lang);
+        let rows = lines.iter().enumerate().map(|(i, l)| render::display_line(l, hl.get(i))).collect();
+        let f = Fly { pane, rows, from, to, color, at: Instant::now() };
+        let t = f.total();
+        self.fx.flies.push(f);
+        self.fx.want_frame = true;
+        t
+    }
+
+    /// Merges a floating snippet into a file: a gap opens, the lines fly over, the card fades where it stood.
+    pub(crate) fn merge_fx(&mut self, s: u64, f: u64, at: usize, del: usize) -> bool {
+        self.doc.sync_refs();
+        let (Some(sc), Some(fc)) = (self.doc.card(s).cloned(), self.doc.card(f).cloned()) else { return false };
+        if !self.doc.merge(s, f, at, del) { return false; }
+        let (at, n) = (at.min(fc.lines.len()), sc.lines.len());
+        let from = self.code_origin(&sc, 0);
+        let to = (fc.x + self.gutter(fc.lines.len() + n - del.min(fc.lines.len())), fc.y + HEAD + PAD + at as f32 * LH);
+        let hide = if self.shared || sc.pane == fc.pane { self.fly(fc.pane, &sc.lines, &fc.lang, from, to, sc.color) } else { 300. };
+        self.fx.line(f, at, n, LineKind::Grow, hide);
+        self.fx.line(f, at + n, del, LineKind::Shut, 0.);
+        self.fx.fades.push(Fade { pane: sc.pane, x: sc.x, y: sc.y, w: sc.w, h: self.card_height(&sc), color: sc.color, title: sc.title.clone(), at: Instant::now() });
+        self.fx.fresh.insert(s, later(hide));
+        self.selected = HashSet::from([s]);
+        self.picked = None;
+        true
+    }
+
+    /// Cuts a region out into a floating card at (x, y): the file closes up and the lines fly to the card.
+    pub(crate) fn detach_fx(&mut self, region: u64, x: f32, y: f32, pane: u64) -> Option<u64> {
+        let r = self.doc.region(region)?.clone();
+        let f = self.doc.card(r.file)?.clone();
+        let from = self.code_origin(&f, r.start);
+        let id = self.doc.detach_region(region, x, y, pane)?;
+        let n = r.end - r.start + 1;
+        self.fx.line(r.file, r.start, n, LineKind::Shut, 0.);
+        self.fly_to_new(id, &f, from, r.color);
+        Some(id)
+    }
+
+    pub(crate) fn copy_fx(&mut self, file: u64, a: usize, b: usize, x: f32, y: f32) -> Option<u64> {
+        let f = self.doc.card(file)?.clone();
+        let id = self.doc.copy_out(file, a, b, x, y)?;
+        let color = self.doc.card(id).map_or(0xc792ea, |c| c.color);
+        self.fly_to_new(id, &f, self.code_origin(&f, a), color);
+        Some(id)
+    }
+
+    pub(crate) fn reference_fx(&mut self, region: u64, x: f32, y: f32, pane: u64) -> Option<u64> {
+        let r = self.doc.region(region)?.clone();
+        let f = self.doc.card(r.file)?.clone();
+        let id = self.doc.make_reference(region, x, y, pane)?;
+        self.fly_to_new(id, &f, self.code_origin(&f, r.start), r.color);
+        Some(id)
+    }
+
+    /// The new card `id` stays hidden until lines flown from `from` in file `f` reach it, then fades in.
+    fn fly_to_new(&mut self, id: u64, f: &Card, from: (f32, f32), color: u32) {
+        let Some(c) = self.doc.card(id).cloned() else { return };
+        let wait = if self.shared || c.pane == f.pane { self.fly(c.pane, &c.lines, &f.lang, from, self.code_origin(&c, 0), color) } else { 0. };
+        self.fx.born.insert(id, later(wait));
     }
 
     pub(crate) fn apply_to_target(&mut self, id: u64) {
@@ -938,8 +1059,8 @@ impl CanvasView {
         let Some(f) = self.doc.file_by_path(&t.file).map(|c| (c.id, c.lines.len())) else { self.toast(format!("{} isn't in the project", t.file), true); return };
         self.snapshot();
         match t.replace {
-            Some((a, b)) => { let a = (a - 1).min(f.1 - 1); let b = (b - 1).clamp(a, f.1 - 1); self.doc.merge(id, f.0, a, b - a + 1); }
-            None => { self.doc.merge(id, f.0, t.insert_at.map_or(f.1, |n| (n - 1).min(f.1)), 0); }
+            Some((a, b)) => { let a = (a - 1).min(f.1 - 1); let b = (b - 1).clamp(a, f.1 - 1); self.merge_fx(id, f.0, a, b - a + 1); }
+            None => { self.merge_fx(id, f.0, t.insert_at.map_or(f.1, |n| (n - 1).min(f.1)), 0); }
         }
         self.touch();
     }
@@ -1152,7 +1273,15 @@ impl CanvasView {
 
     pub(crate) fn apply_draft(&mut self, id: u64) {
         self.snapshot();
-        if self.doc.apply_draft(id) { self.toast("Draft applied", false); let o = self.doc.draft_owner(id); let base = self.doc.base_lines(o); if let Some(t) = self.doc.talk_mut(o) { t.draft = Some(base); } self.touch(); }
+        let owner = self.doc.draft_owner(id);
+        let added: Vec<usize> = match (self.doc.region(owner), self.doc.talk(owner).and_then(|t| t.draft.clone())) {
+            (Some(r), Some(d)) => crate::diff::diff_lines(&self.doc.region_lines(r), &d).into_iter().filter_map(|o| match o { crate::diff::Op::Add(b) => Some(r.start + b), _ => None }).collect(),
+            _ => Vec::new(),
+        };
+        let file = self.doc.region(owner).map(|r| r.file);
+        if self.doc.apply_draft(id) {
+            if let Some(f) = file { for l in added { self.fx.line(f, l, 1, LineKind::Flash, 0.); } }
+            self.toast("Draft applied", false); let o = self.doc.draft_owner(id); let base = self.doc.base_lines(o); if let Some(t) = self.doc.talk_mut(o) { t.draft = Some(base); } self.touch(); }
         else { self.undo.pop(); self.toast("The draft has no changes.", false); }
     }
 
@@ -1301,7 +1430,8 @@ impl CanvasView {
                 match hit { Some(c) => y = c.y + self.card_height(c) + 24., None => break }
             }
             let lang = d.file.clone().or(d.lang.map(|l| if l.contains('.') { l } else { format!("x.{l}") })).or(near_card.as_ref().map(|c| c.lang.clone())).unwrap_or_else(|| guess_lang(&lines));
-            self.doc.add_floating(d.title, lines, lang, x, y, 460., pane, target);
+            let id = self.doc.add_floating(d.title, lines, lang, x, y, 460., pane, target);
+            self.fx.born.insert(id, Instant::now());
         }
         if n > 0 { self.toast(format!("{n} snippet(s) drafted on the canvas"), false); self.touch(); }
     }
@@ -1369,7 +1499,9 @@ impl CanvasView {
         for (_, id, _, h) in &files {
             let i = heights.iter().enumerate().min_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
             let c = self.doc.card_mut(*id).unwrap();
+            let old = (c.x, c.y);
             c.x = i as f32 * col_w; c.y = heights[i]; c.pane = pane;
+            self.fx.slides.insert(*id, (old.0 - c.x, old.1 - c.y, Instant::now()));
             heights[i] += h + 60.;
         }
         let h = heights.iter().cloned().fold(0., f32::max).min(4000.);

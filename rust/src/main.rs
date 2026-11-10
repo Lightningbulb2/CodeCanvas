@@ -67,7 +67,7 @@ fn main() {
     let (tx, rx) = channel();
     listen(id, tx);
 
-    Application::new().run(move |cx: &mut App| {
+    Application::new().with_assets(ui::fx::Icons).run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1500.), px(950.)), cx);
         let opts = WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() };
         cx.open_window(opts, |window, cx| cx.new(|cx| ui::CanvasView::new(root, file, rx, window, cx))).unwrap();
