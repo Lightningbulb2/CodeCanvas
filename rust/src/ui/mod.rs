@@ -4,6 +4,7 @@ mod find;
 pub mod fx;
 mod panels;
 mod render;
+mod tiles;
 
 use crate::agent::{self, ChatRequest, Draft, Segment};
 use crate::highlight::{Tok, highlight};
@@ -157,6 +158,14 @@ pub struct CanvasView {
     pub(crate) fx: Fx,
     /// Open find bars, by card.
     pub(crate) finds: HashMap<u64, find::Find>,
+    /// Cached text bitmaps, by (view, card, tile index). See `tiles.rs`.
+    pub(crate) tiles: HashMap<(u64, u64, usize), tiles::Tile>,
+    pub(crate) raster: Arc<std::sync::Mutex<Option<tiles::Raster>>>,
+    /// Tiles that may still be drawn this frame, so a burst of new ones can't stall it.
+    pub(crate) tile_budget: usize,
+    pub(crate) frame: u64,
+    pub(crate) scale: f32,
+    pub(crate) dead_tiles: Vec<Arc<gpui::RenderImage>>,
     /// Current widths of the explorer and the global chat (they slide open and shut).
     pub(crate) side: (f32, f32),
     pub(crate) sel_at: Instant,
@@ -265,6 +274,9 @@ impl CanvasView {
             cx.background_executor().timer(Duration::from_millis(33)).await;
             if this.update(cx, |t, cx| if t.pump() { cx.notify(); }).is_err() { break; }
         }).detach();
+        // the tile rasteriser loads the system fonts, so it gets ready on its own thread
+        let raster: Arc<std::sync::Mutex<Option<tiles::Raster>>> = Arc::default();
+        { let r = raster.clone(); std::thread::spawn(move || { let made = tiles::Raster::new(mono()); *r.lock().unwrap() = made; }); }
         let ts = window.text_system();
         let id = ts.resolve_font(&font(mono()));
         let char_ratio = ts.advance(id, px(100.), 'm').map(|s| fl(s.width) / 100.).unwrap_or(0.6);
@@ -275,7 +287,7 @@ impl CanvasView {
             drag: None, live: None, selected: HashSet::new(), picked: None, hover_tab: None, doomed: Vec::new(), undo: Vec::new(), redo: Vec::new(),
             inputs: HashMap::new(), focus_input: None, editing: None, busy: HashMap::new(), tx, rx, explaining: HashMap::new(), explain_queue: None, menu: None, pick: None,
             models: None, show_settings: false, show_help: false, expanded: HashSet::new(), chat_open: true, explorer_open: true, hist_open: true, spans: HashMap::new(), scrolls: HashMap::new(),
-            pending_bottom: HashSet::new(), space: false, toasts: Vec::new(), char_ratio, anim: HashMap::new(), fx: Fx::default(), finds: HashMap::new(), side: (EXPLORER_W, CHAT_W), sel_at: Instant::now(), started: Instant::now(), focus, win_size: (1500., 950.), mouse: (0., 0.), mods: Default::default(),
+            pending_bottom: HashSet::new(), space: false, toasts: Vec::new(), char_ratio, anim: HashMap::new(), fx: Fx::default(), finds: HashMap::new(), tiles: HashMap::new(), raster, tile_budget: 0, frame: 0, scale: 1., dead_tiles: Vec::new(), side: (EXPLORER_W, CHAT_W), sel_at: Instant::now(), started: Instant::now(), focus, win_size: (1500., 950.), mouse: (0., 0.), mods: Default::default(),
             state_dirty: None, mtimes: HashMap::new(), last_poll: Instant::now(), inbox, saver, doc_dirty: true,
         };
         if let Some(s) = this.project.load_state() {
@@ -1441,7 +1453,28 @@ impl CanvasView {
         self.mtimes.retain(|id, _| alive.contains(id));
         self.fx.forget_except(&alive);
         self.finds.retain(|id, _| alive.contains(id));
+        self.retire_tiles(|k, _| !alive.contains(&k.1));
         self.inputs.retain(|k, b| match k { Input::Chat(id) | Input::Ask(id) => alive.contains(id) && !b.is_empty(), _ => true });
+    }
+
+    /// Drops the tiles `gone` picks; their images are released at the next frame.
+    pub(crate) fn retire_tiles(&mut self, gone: impl Fn(&(u64, u64, usize), &tiles::Tile) -> bool) {
+        let dead = &mut self.dead_tiles;
+        self.tiles.retain(|k, t| { let drop = gone(k, t); if drop { dead.extend(t.img.take()); } !drop });
+    }
+
+    /// Once per frame: forget tiles nothing has drawn for a while, and keep the cache within its budget.
+    pub(crate) fn trim_tiles(&mut self) {
+        const BUDGET: usize = 192 << 20;
+        let frame = self.frame;
+        self.retire_tiles(|_, t| frame.saturating_sub(t.used) > 240);
+        let total: usize = self.tiles.values().map(|t| t.bytes).sum();
+        if total > BUDGET {
+            let mut ages: Vec<u64> = self.tiles.values().map(|t| t.used).collect();
+            ages.sort_unstable();
+            let cut = ages[ages.len() / 3];
+            self.retire_tiles(|_, t| t.used <= cut && t.used != frame);
+        }
     }
 
     fn handle_ev(&mut self, ev: Ev) {

@@ -61,8 +61,8 @@ pub(crate) fn display_line(line: &str, spans: Option<&Vec<(Range<usize>, Tok)>>)
 struct Row { y: f32, dx: f32, num: SharedString, text: SharedString, hl: Vec<(Range<usize>, HighlightStyle)>, bg: [Option<Hsla>; 2], alpha: f32, sel: Option<(f32, f32)>, caret: Option<f32>,
     /// Find matches on this line: (x, width, is the current one).
     found: Vec<(f32, f32, bool)>,
-    /// When the text is too small to read: (column, columns, colour) of each word, drawn as a bar.
-    bars: Vec<(u16, u16, Hsla)> }
+    /// The text of this line is in a tile; only its backgrounds are painted here.
+    covered: bool }
 
 /// Lines are shaped once at this size and painted at whatever size the zoom needs, so zooming never
 /// reshapes text: the shaped line is found in the cache every frame and only its glyphs are drawn.
@@ -81,24 +81,6 @@ fn text_runs(len: usize, hl: &[(Range<usize>, HighlightStyle)], base: &Font, ita
     if at < len { out.push(run(len - at, base)); }
     out
 }
-
-/// The words of a line as (column, width, colour), for drawing text that is too small to read.
-fn word_bars(line: &str, hl: &[(Range<usize>, HighlightStyle)]) -> Vec<(u16, u16, Hsla)> {
-    let (mut out, mut col, mut start, mut h): (Vec<(u16, u16, Hsla)>, usize, Option<(usize, usize)>, usize) = (Vec::new(), 0, None, 0);
-    let close = |from: Option<(usize, usize)>, col: usize, h: &mut usize, out: &mut Vec<(u16, u16, Hsla)>| {
-        let Some((c0, byte)) = from else { return };
-        while *h < hl.len() && byte >= hl[*h].0.end { *h += 1; }
-        let color = hl.get(*h).filter(|(r, _)| byte >= r.start).and_then(|(_, s)| s.color).unwrap_or(col_fg());
-        if out.len() < 40 && c0 < 600 { out.push((c0 as u16, (col - c0).min(600) as u16, color)); }
-    };
-    for (byte, ch) in line.char_indices() {
-        if ch == ' ' || ch == '\t' { close(start.take(), col, &mut h, &mut out); col += if ch == '\t' { 4 } else { 1 }; }
-        else { if start.is_none() { start = Some((col, byte)); } col += 1; }
-    }
-    close(start, col, &mut h, &mut out);
-    out
-}
-fn col_fg() -> Hsla { col(FG) }
 
 /// Paints a line shaped at [`SHAPE_PX`]: glyphs are placed for a `pos_px` font (exactly what the zoom
 /// asks for, so text glides with its card) and drawn at `glyph_px` (the nearest quarter pixel, so the
@@ -180,9 +162,11 @@ impl CanvasView {
             layer = layer.child(div().absolute().left_0().w_full().top(px(y)).h(px((b - a + 1) as f32 * lh)).bg(cola(SEL, 0.55)).border_l(px((3. * z).max(1.))).border_color(col(ACCENT)));
         }
         let caret = editing.then(|| self.inputs[&Input::Editor(id)].clone());
-        // Below about five pixels text can't be read, so each word is drawn as one small bar instead of
-        // glyph by glyph: far less to draw when many large files are in view.
-        let tiny = !editing && self.code_px(z) < 5.;
+        // Text comes from cached tiles wherever every line sits at its plain place; a card that is being
+        // edited, dragged into or out of, or running a line effect is drawn directly instead.
+        let plain = !editing && !opaque && !self.fx.lines.iter().any(|l| l.file == id)
+            && !live.as_ref().is_some_and(|l| l.over == Some(id) || (l.src.is_some_and(|s| s.0 == id) && !l.ref_mode));
+        let (tiled, tile_draws) = if plain && last > first { self.tiles_for(pane, card, &spans, start_no, first, last, z) } else { (Vec::new(), Vec::new()) };
         let mut rows: Vec<Row> = Vec::with_capacity(last.saturating_sub(first));
         let (hits, hit_cur) = (self.find_hits(id), self.finds.get(&id).map_or(usize::MAX, |f| f.cur));
         let mut hit = hits.partition_point(|h| h.line < first);
@@ -195,10 +179,10 @@ impl CanvasView {
             let alpha = self.fx.alpha(id, i);
             if alpha <= 0.01 { continue; }
             let (flash, dx) = (self.fx.flash(id, i), self.fx.dx(id, i));
-            let (text, hl) = if tiny { (SharedString::default(), spans.get(i).map_or(Vec::new(), |s| s.iter().map(|(r, t)| (r.clone(), HighlightStyle { color: Some(tok_color(*t)), ..Default::default() })).collect())) } else { display_line(&lines[i], spans.get(i)) };
+            let covered = tiled.get(i / tiles::TILE - first / tiles::TILE).copied().unwrap_or(false);
+            let (text, hl) = if covered { (SharedString::default(), Vec::new()) } else { display_line(&lines[i], spans.get(i)) };
             let mut row = Row { y: (PAD + i as f32 * LH + off) * z, dx: dx * z, num: (start_no as isize + i as isize + shift).to_string().into(), text, hl,
-                bg: [opaque.then(|| col(CARD)), (flash > 0.).then(|| cola(OK, flash))], alpha, sel: None, caret: None, found: Vec::new(), bars: Vec::new() };
-            if tiny { row.bars = word_bars(&lines[i], &row.hl); row.hl = Vec::new(); }
+                bg: [opaque.then(|| col(CARD)), (flash > 0.).then(|| cola(OK, flash))], alpha, sel: None, caret: None, found: Vec::new(), covered };
             while hit < hits.len() && hits[hit].line < i { hit += 1; }
             while hit < hits.len() && hits[hit].line == i {
                 let h = hits[hit];
@@ -218,9 +202,9 @@ impl CanvasView {
                 }
                 if b.cur.line == i { row.caret = Some(gutter + crate::ui::visual_len(&lines[i][..b.cur.col]) as f32 * cw); }
             }
-            rows.push(row);
+            if !covered || !row.found.is_empty() || row.bg.iter().any(Option::is_some) { rows.push(row); }
         }
-        let (font_px, pos_px, bar_cw) = (self.code_px(z), 12.5 * z, cw);
+        let (font_px, pos_px) = (self.code_px(z), 12.5 * z);
         let (num_right, caret_w) = (gutter - 12. * z, (1.5 * z).max(1.));
         layer = layer.child(canvas(|_, _, _| (), move |b: Bounds<Pixels>, _, window, _| {
             let base = font(mono());
@@ -235,23 +219,67 @@ impl CanvasView {
                     let b = Bounds::new(point(origin.x + px(*x), origin.y), size(px(*w), lh));
                     window.paint_quad(if *current { quad(b, px(2.), col(0x515c6a), px(1.), col(WARN), BorderStyle::Solid) } else { quad(b, px(2.), cola(0xea5c00, 0.33), px(0.), transparent_black(), BorderStyle::Solid) });
                 }
-                if !r.bars.is_empty() || r.text.is_empty() {
-                    let (cw, h) = (px(bar_cw), px((fl(lh) * 0.42).max(1.)));
-                    for (c0, n, color) in &r.bars {
-                        let mut color = *color; color.a *= 0.6 * r.alpha;
-                        window.paint_quad(fill(Bounds::new(point(origin.x + px(gutter) + cw * *c0 as f32, origin.y + (lh - h) / 2.), size(cw * *n as f32 - px(0.5), h)), color));
-                    }
-                    continue;
-                }
+                if r.covered { continue; }
                 let num = ts.layout_line(&r.num, px(SHAPE_PX), &text_runs(r.num.len(), &[], &base, &base), None);
                 paint_scaled(&num, &[], cola(MUTED, 0.7 * r.alpha), 1., point(origin.x + px(num_right - fl(num.width) * pos_px / SHAPE_PX), origin.y), lh, font_px, pos_px, window);
                 let code = ts.layout_line(&r.text, px(SHAPE_PX), &text_runs(r.text.len(), &r.hl, &base, &italic), None);
                 paint_scaled(&code, &r.hl, col(FG), r.alpha, point(origin.x + px(gutter), origin.y), lh, font_px, pos_px, window);
                 if let Some(x) = r.caret { window.paint_quad(fill(Bounds::new(point(origin.x + px(x), origin.y), size(px(caret_w), lh)), col(WARN))); }
             }
+            let sf = window.scale_factor();
+            for (img, y, w, h, exact) in tile_draws {
+                // a tile at its own zoom lands exactly on device pixels, so it is as sharp as direct text
+                let snap = |v: Pixels| if exact { px((fl(v) * sf).round() / sf) } else { v };
+                let _ = window.paint_image(Bounds::new(point(snap(b.origin.x), snap(b.origin.y + px(y))), size(px(w), px(h))), gpui::Corners::default(), img, 0, false);
+            }
         }).absolute().size_full());
         self.live = live;
         layer
+    }
+
+    /// The tiles covering lines `first..last` of a card: which of them are ready (one flag per tile, from
+    /// the tile holding `first`), and what to paint: (image, y, width, height, drawn at its own zoom).
+    /// Missing tiles are rasterised here, a few per frame; until then their lines are drawn directly.
+    #[allow(clippy::too_many_arguments)]
+    fn tiles_for(&mut self, pane: u64, card: &Card, spans: &Rc<Spans>, start_no: usize, first: usize, last: usize, z: f32) -> (Vec<bool>, Vec<(Arc<gpui::RenderImage>, f32, f32, f32, bool)>) {
+        let (id, sf) = (card.id, self.scale);
+        let raw = self.views.get(&pane).copied().unwrap_or(self.views[&self.active]);
+        let gliding = (raw.t.z - raw.v.z).abs() > 1e-4;
+        let want_z = if gliding { raw.t.z } else { z };
+        let raster = self.raster.clone();
+        let mut guard = raster.try_lock().ok();
+        let (mut ready, mut draws) = (Vec::new(), Vec::new());
+        for t in first / tiles::TILE..=(last - 1) / tiles::TILE {
+            let key = (pane, id, t);
+            let (a, b) = (t * tiles::TILE, ((t + 1) * tiles::TILE).min(card.lines.len()));
+            let have = self.tiles.get(&key).filter(|x| Arc::ptr_eq(&x.lines, &card.lines) && x.start_no == start_no && x.scale == sf).map(|x| x.z);
+            // Draw it when there is nothing usable; an out-of-date zoom waits until the glide has settled.
+            if have != Some(want_z) && (have.is_none() || !gliding) {
+                if let (true, Some(r)) = (self.tile_budget > 0, guard.as_mut().and_then(|g| g.as_mut())) {
+                    self.tile_budget -= 1;
+                    let k = want_z * sf;
+                    let spec = tiles::Spec { lines: &card.lines[a..b], spans: spans.get(a..b.min(spans.len())).unwrap_or(&[]), first_no: start_no + a, gutter: self.gutter(card.lines.len()) * k,
+                        num_right: (self.gutter(card.lines.len()) - 12.) * k, cw: self.char_w(1.) * k, lh: LH * k, font_px: 12.5 * k };
+                    let made = r.tile(&spec).and_then(|(w, h, px)| { let bytes = px.len(); tiles::image(w, h, px).map(|img| (img, w as f32 / sf, h as f32 / sf, bytes)) });
+                    let (img, w, h, bytes) = match made { Some((i, w, h, n)) => (Some(i), w, h, n), None => (None, 0., 0., 0) };
+                    if let Some(old) = self.tiles.insert(key, tiles::Tile { lines: card.lines.clone(), z: want_z, scale: sf, start_no, img, w, h, bytes, used: self.frame }) { self.dead_tiles.extend(old.img); }
+                }
+                if self.tile_budget == 0 || guard.as_ref().is_none_or(|g| g.is_none()) { self.fx.want_frame = true; }
+            }
+            let usable = self.tiles.get_mut(&key).filter(|x| Arc::ptr_eq(&x.lines, &card.lines) && x.start_no == start_no && x.scale == sf);
+            ready.push(match usable {
+                Some(tile) => {
+                    tile.used = self.frame;
+                    if tile.z != want_z && !gliding { self.fx.want_frame = true; }
+                    match &tile.img {
+                        Some(img) => { let k = z / tile.z; draws.push((img.clone(), (PAD + a as f32 * LH) * z, tile.w * k, tile.h * k, tile.z == z)); true }
+                        None => false,
+                    }
+                }
+                None => false,
+            });
+        }
+        (ready, draws)
     }
 
     /// The region bars, highlights and resize handles inside a file card.
@@ -706,6 +734,11 @@ impl Render for CanvasView {
         let vs = window.viewport_size();
         self.win_size = (fl(vs.width), fl(vs.height));
         self.fx.tick();
+        self.frame += 1;
+        self.scale = window.scale_factor();
+        self.tile_budget = 6;
+        self.trim_tiles();
+        for img in std::mem::take(&mut self.dead_tiles) { cx.drop_image(img, Some(window)); }
         // the side panels slide open and shut; the canvas follows their edges
         let (ex, ch) = (self.explorer_open, self.chat_open);
         self.side = (EXPLORER_W * self.fx.tween(Tw::Explorer, if ex { 1. } else { 0. }, 200.), CHAT_W * self.fx.tween(Tw::Chat, if ch { 1. } else { 0. }, 200.));

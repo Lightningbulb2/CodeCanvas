@@ -903,7 +903,9 @@ dependencies = [
 name = "codecanvas"
 version = "0.1.0"
 dependencies = [
+ "cosmic-text",
  "gpui",
+ "image",
  "regex",
  "serde",
  "serde_json",
