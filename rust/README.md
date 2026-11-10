@@ -36,6 +36,21 @@ Drag across lines in a file, then pick from the toolbar: **Snippet**, **Detach**
 - **Merge:** drag a card onto a file, or select cards and right-click a file → Merge.
 - **Dissolve all:** from a file's or the canvas's right-click menu.
 
+## Find and replace
+
+**Ctrl+F** (or the magnifier in a card's header) opens a find bar at the top of that file or snippet; **Ctrl+H** opens it with Replace. It searches the card being edited, else the selected card, else the one under the pointer. With a snippet inside a file selected, it searches the file limited to that snippet's lines.
+
+| | |
+|---|---|
+| Next / previous match | Enter / Shift+Enter (also F3 / Shift+F3) |
+| Match case, whole word, regular expression | `Aa` `ab` `.*` (Alt+C, Alt+W, Alt+R) |
+| Find in selection | `≡` (Alt+L), limits the search to the selected lines |
+| Replace / replace all | Enter in the Replace box / Ctrl+Alt+Enter |
+| Preserve case | `AB` (Alt+P) |
+| Close | Esc |
+
+In regular-expression mode the replacement can use `$1`, `$2`, … for groups. Matches are found within a line; a pattern can't span lines. Replacing in a reference card changes its source file, and every replace is one undo step.
+
 ## LLM
 
 Every file and snippet has its own chat (▶ tab), and the panel on the right is a general chat. *Snippet/File* sends just that code; *Global* adds the context list (top right, with its history log). ↺ resets a chat.

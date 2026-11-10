@@ -208,6 +208,7 @@ fn icon_body(name: &str) -> Option<&'static str> {
         "draft" => r#"<path d="M4 20h4L19 9l-4-4L4 16v4zM13.5 6.5l4 4"/>"#,
         "apply" => r#"<path d="M12 4v11M7 11l5 5 5-5M5 20h14"/>"#,
         "ref" => r#"<path d="M9 5h10v10M19 5L6 18"/>"#,
+        "search" => r#"<circle cx="10.5" cy="10.5" r="6.5"/><path d="M20 20l-4.6-4.6"/>"#,
         "tri" => r#"<path d="M8 5l11 7-11 7z" fill="black"/>"#,
         _ => return None,
     })

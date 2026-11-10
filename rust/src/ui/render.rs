@@ -58,7 +58,9 @@ pub(crate) fn display_line(line: &str, spans: Option<&Vec<(Range<usize>, Tok)>>)
 }
 
 /// One line of a card, ready to be painted straight onto the card (no layout elements per line).
-struct Row { y: f32, dx: f32, num: SharedString, text: SharedString, hl: Vec<(Range<usize>, HighlightStyle)>, bg: [Option<Hsla>; 2], alpha: f32, sel: Option<(f32, f32)>, caret: Option<f32> }
+struct Row { y: f32, dx: f32, num: SharedString, text: SharedString, hl: Vec<(Range<usize>, HighlightStyle)>, bg: [Option<Hsla>; 2], alpha: f32, sel: Option<(f32, f32)>, caret: Option<f32>,
+    /// Find matches on this line: (x, width, is the current one).
+    found: Vec<(f32, f32, bool)> }
 
 /// Lines are shaped once at this size and painted at whatever size the zoom needs, so zooming never
 /// reshapes text: the shaped line is found in the cache every frame and only its glyphs are drawn.
@@ -159,6 +161,8 @@ impl CanvasView {
         }
         let caret = editing.then(|| self.inputs[&Input::Editor(id)].clone());
         let mut rows: Vec<Row> = Vec::with_capacity(last.saturating_sub(first));
+        let (hits, hit_cur) = (self.find_hits(id), self.finds.get(&id).map_or(usize::MAX, |f| f.cur));
+        let mut hit = hits.partition_point(|h| h.line < first);
         let cw = self.char_w(z);
         for i in first..last {
             let lifted = live.as_ref().is_some_and(|l| l.src.is_some_and(|s| s.0 == id && !l.ref_mode && i >= s.1 && i <= s.2));
@@ -170,7 +174,16 @@ impl CanvasView {
             let (flash, dx) = (self.fx.flash(id, i), self.fx.dx(id, i));
             let (text, hl) = display_line(&lines[i], spans.get(i));
             let mut row = Row { y: (PAD + i as f32 * LH + off) * z, dx: dx * z, num: (start_no as isize + i as isize + shift).to_string().into(), text, hl,
-                bg: [opaque.then(|| col(CARD)), (flash > 0.).then(|| cola(OK, flash))], alpha, sel: None, caret: None };
+                bg: [opaque.then(|| col(CARD)), (flash > 0.).then(|| cola(OK, flash))], alpha, sel: None, caret: None, found: Vec::new() };
+            while hit < hits.len() && hits[hit].line < i { hit += 1; }
+            while hit < hits.len() && hits[hit].line == i {
+                let h = hits[hit];
+                if lines[i].is_char_boundary(h.start) && lines[i].is_char_boundary(h.end) {
+                    let from = crate::ui::visual_len(&lines[i][..h.start]);
+                    row.found.push((gutter + from as f32 * cw, crate::ui::visual_len(&lines[i][h.start..h.end]) as f32 * cw, hit == hit_cur));
+                }
+                hit += 1;
+            }
             if let Some(b) = &caret {
                 if let Some((a, e)) = b.selection() {
                     if i >= a.line && i <= e.line {
@@ -194,6 +207,10 @@ impl CanvasView {
                 let origin = point(b.origin.x + px(r.dx), b.origin.y + px(r.y));
                 for bg in r.bg.into_iter().flatten() { window.paint_quad(fill(Bounds::new(origin, size(b.size.width, lh)), bg)); }
                 if let Some((x, w)) = r.sel { window.paint_quad(fill(Bounds::new(point(origin.x + px(x), origin.y), size(px(w), lh)), cola(SEL, 0.6))); }
+                for (x, w, current) in &r.found {
+                    let b = Bounds::new(point(origin.x + px(*x), origin.y), size(px(*w), lh));
+                    window.paint_quad(if *current { quad(b, px(2.), col(0x515c6a), px(1.), col(WARN), BorderStyle::Solid) } else { quad(b, px(2.), cola(0xea5c00, 0.33), px(0.), transparent_black(), BorderStyle::Solid) });
+                }
                 let num = ts.layout_line(&r.num, px(SHAPE_PX), &text_runs(r.num.len(), &[], &base, &base), None);
                 paint_scaled(&num, &[], cola(MUTED, 0.7 * r.alpha), 1., point(origin.x + px(num_right - fl(num.width) * pos_px / SHAPE_PX), origin.y), lh, font_px, pos_px, window);
                 let code = ts.layout_line(&r.text, px(SHAPE_PX), &text_runs(r.text.len(), &r.hl, &base, &italic), None);
@@ -267,6 +284,7 @@ impl CanvasView {
             } else { icon("explain", sz, col(MUTED)) };
             tools = tools
                 .child(tool_with(explain, sz, cx, move |t, _, _| t.explain(path.clone())))
+                .child(tool("search", sz, MUTED, cx, move |t, _, _| if t.finds.contains_key(&id) { t.close_find(id) } else { t.open_find(id, false) }))
                 .child(tool("notes", sz, MUTED, cx, move |t, _, _| t.toggle_notes(id)))
                 .child(tool("chat", sz, MUTED, cx, move |t, _, _| t.toggle_chat(id)))
                 .child(tool("ctx", sz, ctx_color, cx, move |t, _, _| t.toggle_ctx(id)))
@@ -278,6 +296,7 @@ impl CanvasView {
             if let Some(r) = card.ref_of { tools = tools.child(tool("editor", sz, MUTED, cx, move |t, _, _| t.focus_card(r))); }
             if card.target.is_some() { tools = tools.child(tool("merge", sz, MUTED, cx, move |t, _, _| t.apply_to_target(id))); }
             tools = tools
+                .child(tool("search", sz, MUTED, cx, move |t, _, _| if t.finds.contains_key(&id) { t.close_find(id) } else { t.open_find(id, false) }))
                 .child(tool("ctx", sz, ctx_color, cx, move |t, _, _| t.toggle_ctx(id)))
                 .child(tool("chat", sz, MUTED, cx, move |t, _, _| t.toggle_chat(id)))
                 .child(tool(if is_ref { "close" } else { "trash" }, sz, MUTED, cx, move |t, _, _| t.close_card(id)));
@@ -393,7 +412,8 @@ impl CanvasView {
                 out.push(self.ghost_el(v, true).into_any_element());
                 out.push(lines_overlay.into_any_element());
             } else {
-                out.push(shell.child(lines).children(regions).child(header).child(resize).into_any_element());
+                let bar = self.find_bar(id, c.w, z, cx);
+                out.push(shell.child(lines).children(regions).child(header).child(resize).children(bar).into_any_element());
             }
             drawers.extend(self.overlays(c, pane, sx, sy, sw, z, cx));
         }

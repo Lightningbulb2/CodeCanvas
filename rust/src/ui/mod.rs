@@ -1,5 +1,6 @@
 //! The CodeCanvas view: state, views/panes, pointer and keyboard handling, LLM plumbing.
 
+mod find;
 pub mod fx;
 mod panels;
 mod render;
@@ -40,7 +41,7 @@ pub(crate) type Act = Rc<dyn Fn(&mut CanvasView, &mut Window, &mut Context<Canva
 pub(crate) type Spans = Vec<Vec<(Range<usize>, Tok)>>;
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub(crate) enum Input { Chat(u64), Ask(u64), DraftEdit(u64), Editor(u64), Filter, Rename(u64), Setting(usize) }
+pub(crate) enum Input { Chat(u64), Ask(u64), DraftEdit(u64), Editor(u64), Filter, Find(u64), Replace(u64), Rename(u64), Setting(usize) }
 
 #[derive(Clone, Copy)]
 pub(crate) struct PaneView { pub v: View, pub t: View, pub anchor: (f32, f32) }
@@ -151,6 +152,8 @@ pub struct CanvasView {
     pub(crate) char_ratio: f32,
     pub(crate) anim: HashMap<(u64, usize), f32>,
     pub(crate) fx: Fx,
+    /// Open find bars, by card.
+    pub(crate) finds: HashMap<u64, find::Find>,
     /// Current widths of the explorer and the global chat (they slide open and shut).
     pub(crate) side: (f32, f32),
     pub(crate) sel_at: Instant,
@@ -260,7 +263,7 @@ impl CanvasView {
             drag: None, live: None, selected: HashSet::new(), picked: None, hover_tab: None, doomed: Vec::new(), undo: Vec::new(), redo: Vec::new(),
             inputs: HashMap::new(), focus_input: None, editing: None, busy: HashMap::new(), tx, rx, explaining: HashMap::new(), explain_queue: None, menu: None, pick: None,
             models: None, show_settings: false, show_help: false, expanded: HashSet::new(), chat_open: true, explorer_open: true, hist_open: true, spans: HashMap::new(), scrolls: HashMap::new(),
-            pending_bottom: HashSet::new(), space: false, toasts: Vec::new(), char_ratio, anim: HashMap::new(), fx: Fx::default(), side: (EXPLORER_W, CHAT_W), sel_at: Instant::now(), started: Instant::now(), focus, win_size: (1500., 950.), mouse: (0., 0.), mods: Default::default(),
+            pending_bottom: HashSet::new(), space: false, toasts: Vec::new(), char_ratio, anim: HashMap::new(), fx: Fx::default(), finds: HashMap::new(), side: (EXPLORER_W, CHAT_W), sel_at: Instant::now(), started: Instant::now(), focus, win_size: (1500., 950.), mouse: (0., 0.), mods: Default::default(),
             state_dirty: None, mtimes: HashMap::new(), last_poll: Instant::now(), inbox, saver,
         };
         if let Some(s) = this.project.load_state() {
@@ -651,6 +654,7 @@ impl CanvasView {
             let b = self.input(Input::Editor(id));
             b.set_cursor(line, col, e.modifiers.shift);
             if !e.modifiers.shift { b.anchor = Some(b.cur); }
+            self.focus_input = Some(Input::Editor(id));
             self.drag = Some(Drag::EditSelect { id });
             cx.notify();
             return;
@@ -1191,6 +1195,12 @@ impl CanvasView {
         let ctrl = m.control || m.platform;
         let key = ks.key.as_str();
         let multiline = matches!(k, Input::Editor(_) | Input::DraftEdit(_));
+        match k {
+            Input::Find(id) | Input::Replace(id) => if self.find_key(id, matches!(k, Input::Replace(_)), key, m) { return; },
+            Input::Editor(id) if ctrl && (key == "f" || key == "h") => { self.open_find(id, key == "h"); return; }
+            Input::Editor(id) if key == "f3" => { self.find_step(id, if m.shift { -1 } else { 1 }); return; }
+            _ => {}
+        }
         match key {
             "escape" => {
                 match k {
@@ -1261,6 +1271,7 @@ impl CanvasView {
             "=" | "+" if ctrl => self.zoom_keys(1.25),
             "-" if ctrl => self.zoom_keys(0.8),
             "\\" if ctrl => self.split(!m.shift),
+            "f" | "h" if ctrl => self.open_find_here(e.keystroke.key == "h"),
             "f" if !ctrl => self.fit(pane),
             "delete" | "backspace" if !self.selected.is_empty() => {
                 self.snapshot();
@@ -1414,6 +1425,7 @@ impl CanvasView {
         self.scrolls.retain(|id, _| alive.contains(id) || alive.contains(&id.wrapping_sub(1 << 40)) || *id == u64::MAX - 1);
         self.mtimes.retain(|id, _| alive.contains(id));
         self.fx.forget_except(&alive);
+        self.finds.retain(|id, _| alive.contains(id));
         self.inputs.retain(|k, b| match k { Input::Chat(id) | Input::Ask(id) => alive.contains(id) && !b.is_empty(), _ => true });
     }
 
@@ -1596,7 +1608,7 @@ impl CanvasView {
 
 /// A quick 64-bit fingerprint of some lines (eight bytes at a time), to notice when text changed
 /// without keeping a second copy of it around to compare against.
-fn fingerprint(lines: &[String]) -> u64 {
+pub(crate) fn fingerprint(lines: &[String]) -> u64 {
     const K: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut h = (lines.len() as u64).wrapping_mul(K);
     for l in lines {
