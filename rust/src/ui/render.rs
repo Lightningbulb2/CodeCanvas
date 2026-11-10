@@ -60,7 +60,9 @@ pub(crate) fn display_line(line: &str, spans: Option<&Vec<(Range<usize>, Tok)>>)
 /// One line of a card, ready to be painted straight onto the card (no layout elements per line).
 struct Row { y: f32, dx: f32, num: SharedString, text: SharedString, hl: Vec<(Range<usize>, HighlightStyle)>, bg: [Option<Hsla>; 2], alpha: f32, sel: Option<(f32, f32)>, caret: Option<f32>,
     /// Find matches on this line: (x, width, is the current one).
-    found: Vec<(f32, f32, bool)> }
+    found: Vec<(f32, f32, bool)>,
+    /// When the text is too small to read: (column, columns, colour) of each word, drawn as a bar.
+    bars: Vec<(u16, u16, Hsla)> }
 
 /// Lines are shaped once at this size and painted at whatever size the zoom needs, so zooming never
 /// reshapes text: the shaped line is found in the cache every frame and only its glyphs are drawn.
@@ -79,6 +81,24 @@ fn text_runs(len: usize, hl: &[(Range<usize>, HighlightStyle)], base: &Font, ita
     if at < len { out.push(run(len - at, base)); }
     out
 }
+
+/// The words of a line as (column, width, colour), for drawing text that is too small to read.
+fn word_bars(line: &str, hl: &[(Range<usize>, HighlightStyle)]) -> Vec<(u16, u16, Hsla)> {
+    let (mut out, mut col, mut start, mut h): (Vec<(u16, u16, Hsla)>, usize, Option<(usize, usize)>, usize) = (Vec::new(), 0, None, 0);
+    let close = |from: Option<(usize, usize)>, col: usize, h: &mut usize, out: &mut Vec<(u16, u16, Hsla)>| {
+        let Some((c0, byte)) = from else { return };
+        while *h < hl.len() && byte >= hl[*h].0.end { *h += 1; }
+        let color = hl.get(*h).filter(|(r, _)| byte >= r.start).and_then(|(_, s)| s.color).unwrap_or(col_fg());
+        if out.len() < 40 && c0 < 600 { out.push((c0 as u16, (col - c0).min(600) as u16, color)); }
+    };
+    for (byte, ch) in line.char_indices() {
+        if ch == ' ' || ch == '\t' { close(start.take(), col, &mut h, &mut out); col += if ch == '\t' { 4 } else { 1 }; }
+        else { if start.is_none() { start = Some((col, byte)); } col += 1; }
+    }
+    close(start, col, &mut h, &mut out);
+    out
+}
+fn col_fg() -> Hsla { col(FG) }
 
 /// Paints a line shaped at [`SHAPE_PX`]: glyphs are placed for a `pos_px` font (exactly what the zoom
 /// asks for, so text glides with its card) and drawn at `glyph_px` (the nearest quarter pixel, so the
@@ -135,7 +155,7 @@ impl CanvasView {
         let editing = self.editing == Some(id);
         let edited;
         let lines: &[String] = if editing { edited = self.inputs[&Input::Editor(id)].lines.clone(); &edited } else { &card.lines };
-        self.set_spans(id, lines, &card.lang);
+        if editing { self.set_spans(id, lines, &card.lang); } else { self.set_spans_shared(id, &card.lines, &card.lang); }
         let spans = self.spans[&id].1.clone();
         let live = self.live.take();
         let dragging = live.is_some();
@@ -143,8 +163,8 @@ impl CanvasView {
         let gutter = self.gutter(lines.len()) * z;
         let lh = LH * z;
         let top_px = sy + HEAD * z;
-        let first = (((-top_px) / lh).floor().max(0.) as usize).saturating_sub(40);
-        let last = ((((vh - top_px) / lh).ceil().max(0.) as usize) + 40).min(lines.len());
+        let first = (((-top_px) / lh).floor().max(0.) as usize).saturating_sub(6);
+        let last = ((((vh - top_px) / lh).ceil().max(0.) as usize) + 6).min(lines.len());
         let mut layer = div().absolute().left_0().top(px(HEAD * z)).w_full().bottom_0().overflow_hidden()
             .when(card.is_file() || editing, |d| d.cursor_text())
             .on_mouse_down(MouseButton::Left, cx.listener(move |t, e: &MouseDownEvent, _, cx| {
@@ -160,6 +180,9 @@ impl CanvasView {
             layer = layer.child(div().absolute().left_0().w_full().top(px(y)).h(px((b - a + 1) as f32 * lh)).bg(cola(SEL, 0.55)).border_l(px((3. * z).max(1.))).border_color(col(ACCENT)));
         }
         let caret = editing.then(|| self.inputs[&Input::Editor(id)].clone());
+        // Below about five pixels text can't be read, so each word is drawn as one small bar instead of
+        // glyph by glyph: far less to draw when many large files are in view.
+        let tiny = !editing && self.code_px(z) < 5.;
         let mut rows: Vec<Row> = Vec::with_capacity(last.saturating_sub(first));
         let (hits, hit_cur) = (self.find_hits(id), self.finds.get(&id).map_or(usize::MAX, |f| f.cur));
         let mut hit = hits.partition_point(|h| h.line < first);
@@ -172,9 +195,10 @@ impl CanvasView {
             let alpha = self.fx.alpha(id, i);
             if alpha <= 0.01 { continue; }
             let (flash, dx) = (self.fx.flash(id, i), self.fx.dx(id, i));
-            let (text, hl) = display_line(&lines[i], spans.get(i));
+            let (text, hl) = if tiny { (SharedString::default(), spans.get(i).map_or(Vec::new(), |s| s.iter().map(|(r, t)| (r.clone(), HighlightStyle { color: Some(tok_color(*t)), ..Default::default() })).collect())) } else { display_line(&lines[i], spans.get(i)) };
             let mut row = Row { y: (PAD + i as f32 * LH + off) * z, dx: dx * z, num: (start_no as isize + i as isize + shift).to_string().into(), text, hl,
-                bg: [opaque.then(|| col(CARD)), (flash > 0.).then(|| cola(OK, flash))], alpha, sel: None, caret: None, found: Vec::new() };
+                bg: [opaque.then(|| col(CARD)), (flash > 0.).then(|| cola(OK, flash))], alpha, sel: None, caret: None, found: Vec::new(), bars: Vec::new() };
+            if tiny { row.bars = word_bars(&lines[i], &row.hl); row.hl = Vec::new(); }
             while hit < hits.len() && hits[hit].line < i { hit += 1; }
             while hit < hits.len() && hits[hit].line == i {
                 let h = hits[hit];
@@ -196,7 +220,7 @@ impl CanvasView {
             }
             rows.push(row);
         }
-        let (font_px, pos_px) = (self.code_px(z), 12.5 * z);
+        let (font_px, pos_px, bar_cw) = (self.code_px(z), 12.5 * z, cw);
         let (num_right, caret_w) = (gutter - 12. * z, (1.5 * z).max(1.));
         layer = layer.child(canvas(|_, _, _| (), move |b: Bounds<Pixels>, _, window, _| {
             let base = font(mono());
@@ -210,6 +234,14 @@ impl CanvasView {
                 for (x, w, current) in &r.found {
                     let b = Bounds::new(point(origin.x + px(*x), origin.y), size(px(*w), lh));
                     window.paint_quad(if *current { quad(b, px(2.), col(0x515c6a), px(1.), col(WARN), BorderStyle::Solid) } else { quad(b, px(2.), cola(0xea5c00, 0.33), px(0.), transparent_black(), BorderStyle::Solid) });
+                }
+                if !r.bars.is_empty() || r.text.is_empty() {
+                    let (cw, h) = (px(bar_cw), px((fl(lh) * 0.42).max(1.)));
+                    for (c0, n, color) in &r.bars {
+                        let mut color = *color; color.a *= 0.6 * r.alpha;
+                        window.paint_quad(fill(Bounds::new(point(origin.x + px(gutter) + cw * *c0 as f32, origin.y + (lh - h) / 2.), size(cw * *n as f32 - px(0.5), h)), color));
+                    }
+                    continue;
                 }
                 let num = ts.layout_line(&r.num, px(SHAPE_PX), &text_runs(r.num.len(), &[], &base, &base), None);
                 paint_scaled(&num, &[], cola(MUTED, 0.7 * r.alpha), 1., point(origin.x + px(num_right - fl(num.width) * pos_px / SHAPE_PX), origin.y), lh, font_px, pos_px, window);

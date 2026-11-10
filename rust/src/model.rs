@@ -104,11 +104,21 @@ impl Project {
 
     fn state_file(&self) -> PathBuf { state_dir().join("projects").join(format!("{:016x}.json", self.id())) }
 
+    #[allow(dead_code)]
     pub fn save_state(&self, s: &Saved) -> std::io::Result<()> {
         let file = self.state_file();
         fs::create_dir_all(file.parent().unwrap())?;
         let tmp = file.with_extension("tmp");
         fs::write(&tmp, serde_json::to_vec(s)?)?;
+        fs::rename(tmp, file)
+    }
+
+    /// Writes an already serialised state file (see the saver thread in the view).
+    pub fn save_state_json(&self, json: &str) -> std::io::Result<()> {
+        let file = self.state_file();
+        fs::create_dir_all(file.parent().unwrap())?;
+        let tmp = file.with_extension("tmp");
+        fs::write(&tmp, json)?;
         fs::rename(tmp, file)
     }
 

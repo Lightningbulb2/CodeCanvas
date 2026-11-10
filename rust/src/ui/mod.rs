@@ -68,6 +68,9 @@ pub(crate) enum Drag {
     Explorer { path: String, sx: f32, sy: f32, moved: bool },
 }
 
+/// What a card's highlighting was computed from.
+pub(crate) enum SpanKey { Shared(Lines), Print(u64) }
+
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Via { Tab, Bar, Lines, Shift }
 
@@ -144,7 +147,7 @@ pub struct CanvasView {
     pub(crate) explorer_open: bool,
     pub(crate) hist_open: bool,
     /// Highlighting per card, with a fingerprint of the text it was computed from.
-    pub(crate) spans: HashMap<u64, (u64, Rc<Spans>)>,
+    pub(crate) spans: HashMap<u64, (SpanKey, Rc<Spans>)>,
     pub(crate) scrolls: HashMap<u64, ScrollHandle>,
     pub(crate) pending_bottom: HashSet<u64>,
     pub(crate) space: bool,
@@ -167,7 +170,9 @@ pub struct CanvasView {
     last_poll: Instant,
     inbox: Receiver<String>,
     /// The canvas state is written by its own thread, so a save never stalls a frame.
-    saver: Sender<Saved>,
+    saver: Sender<(Option<Doc>, String)>,
+    /// False while only views moved since the last save: then the document isn't serialised again.
+    doc_dirty: bool,
 }
 
 pub(crate) fn fl(p: Pixels) -> f32 { f32::from(p) }
@@ -241,12 +246,19 @@ impl CanvasView {
         let settings = Settings::load();
         let project = Arc::new(Project::new(root, settings.excluded()).expect("can't open the project folder"));
         let (tx, rx) = channel();
-        let (saver, to_save) = channel::<Saved>();
+        // The saver keeps the document's JSON from the last time it changed. Panning and zooming only
+        // change the small tail of the state file, so megabytes of file text aren't serialised again.
+        let (saver, to_save) = channel::<(Option<Doc>, String)>();
         {
             let (project, tx) = (project.clone(), tx.clone());
-            std::thread::spawn(move || while let Ok(mut s) = to_save.recv() {
-                while let Ok(newer) = to_save.try_recv() { s = newer; }
-                if let Err(e) = project.save_state(&s) { let _ = tx.send(Ev::SaveFailed(e.to_string())); }
+            std::thread::spawn(move || {
+                let mut doc_json = String::new();
+                while let Ok((mut doc, mut rest)) = to_save.recv() {
+                    while let Ok((d, r)) = to_save.try_recv() { if d.is_some() { doc = d; } rest = r; }
+                    if let Some(d) = doc { match serde_json::to_string(&d) { Ok(j) => doc_json = j, Err(e) => { let _ = tx.send(Ev::SaveFailed(e.to_string())); continue; } } }
+                    if doc_json.is_empty() { continue; }
+                    if let Err(e) = project.save_state_json(&format!("{{\"doc\":{doc_json},{rest}}}")) { let _ = tx.send(Ev::SaveFailed(e.to_string())); }
+                }
             });
         }
         cx.spawn(async move |this, cx| loop {
@@ -264,7 +276,7 @@ impl CanvasView {
             inputs: HashMap::new(), focus_input: None, editing: None, busy: HashMap::new(), tx, rx, explaining: HashMap::new(), explain_queue: None, menu: None, pick: None,
             models: None, show_settings: false, show_help: false, expanded: HashSet::new(), chat_open: true, explorer_open: true, hist_open: true, spans: HashMap::new(), scrolls: HashMap::new(),
             pending_bottom: HashSet::new(), space: false, toasts: Vec::new(), char_ratio, anim: HashMap::new(), fx: Fx::default(), finds: HashMap::new(), side: (EXPLORER_W, CHAT_W), sel_at: Instant::now(), started: Instant::now(), focus, win_size: (1500., 950.), mouse: (0., 0.), mods: Default::default(),
-            state_dirty: None, mtimes: HashMap::new(), last_poll: Instant::now(), inbox, saver,
+            state_dirty: None, mtimes: HashMap::new(), last_poll: Instant::now(), inbox, saver, doc_dirty: true,
         };
         if let Some(s) = this.project.load_state() {
             this.doc = s.doc;
@@ -289,7 +301,8 @@ impl CanvasView {
 
     // ---------- small helpers ----------
     pub(crate) fn toast(&mut self, s: impl Into<String>, err: bool) { self.toasts.push((s.into(), err, Instant::now())); }
-    pub(crate) fn touch(&mut self) { self.state_dirty = Some(Instant::now()); }
+    /// The document changed: save it soon.
+    pub(crate) fn touch(&mut self) { self.state_dirty = Some(Instant::now()); self.doc_dirty = true; }
     pub(crate) fn snapshot(&mut self) { self.undo.push(self.doc.clone()); if self.undo.len() > 60 { self.undo.remove(0); } self.redo.clear(); }
     /// A view as it is drawn and hit-tested: its offset on whole pixels. Text can only sit on whole
     /// pixels vertically, so a canvas that glided by fractions would have its text jumping against its
@@ -435,10 +448,12 @@ impl CanvasView {
 
     fn persist(&mut self) {
         self.state_dirty = None;
-        let views = self.views.iter().map(|(k, p)| (*k, p.t)).collect();
-        let s = Saved { doc: self.doc.clone(), layout: self.layout.clone(), views, shared: self.shared, active: self.active };
+        let views: Vec<(u64, View)> = self.views.iter().map(|(k, p)| (*k, p.t)).collect();
+        let json = |v: serde_json::Result<String>| v.unwrap_or_else(|_| "null".into());
+        let rest = format!("\"layout\":{},\"views\":{},\"shared\":{},\"active\":{}", json(serde_json::to_string(&self.layout)), json(serde_json::to_string(&views)), self.shared, self.active);
         // cloning the document is cheap: card text is shared, not copied
-        let _ = self.saver.send(s);
+        let doc = std::mem::take(&mut self.doc_dirty).then(|| self.doc.clone());
+        let _ = self.saver.send((doc, rest));
     }
 
     pub(crate) fn open_in_editor(&mut self, id: u64, line: usize) {
@@ -472,7 +487,7 @@ impl CanvasView {
         }
         if moved {
             self.fx.want_frame = true;
-            self.touch();
+            self.state_dirty = Some(Instant::now()); // the view moved; the document didn't
             if self.drag.is_some() { let (x, y) = self.mouse; let m = self.mods; self.pointer_moved(x, y, m); }
         }
     }
@@ -1601,8 +1616,16 @@ impl CanvasView {
 
     pub(crate) fn set_spans(&mut self, id: u64, lines: &[String], lang: &str) {
         let print = fingerprint(lines);
-        if self.spans.get(&id).is_some_and(|(p, _)| *p == print) { return; }
-        self.spans.insert(id, (print, Rc::new(highlight(lines, lang))));
+        if self.spans.get(&id).is_some_and(|(p, _)| matches!(p, SpanKey::Print(x) if *x == print)) { return; }
+        self.spans.insert(id, (SpanKey::Print(print), Rc::new(highlight(lines, lang))));
+    }
+
+    /// The same for a card's own text. The cache holds on to the lines it highlighted, and shared lines
+    /// are copied before they are written, so "the same allocation" means "the same text": checking
+    /// costs nothing, however large the file.
+    pub(crate) fn set_spans_shared(&mut self, id: u64, lines: &Lines, lang: &str) {
+        if self.spans.get(&id).is_some_and(|(p, _)| matches!(p, SpanKey::Shared(l) if Arc::ptr_eq(l, lines))) { return; }
+        self.spans.insert(id, (SpanKey::Shared(lines.clone()), Rc::new(highlight(lines, lang))));
     }
 }
 
