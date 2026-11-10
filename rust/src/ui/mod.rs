@@ -100,6 +100,7 @@ pub(crate) enum Ev {
     Progress(String, Vec<Segment>),
     ExplainDone(String, Result<(), String>),
     Models(Vec<String>),
+    SaveFailed(String),
 }
 
 pub(crate) struct MenuItem { pub label: String, pub act: Option<Act> }
@@ -141,7 +142,8 @@ pub struct CanvasView {
     pub(crate) chat_open: bool,
     pub(crate) explorer_open: bool,
     pub(crate) hist_open: bool,
-    pub(crate) spans: HashMap<u64, (Vec<String>, Rc<Spans>)>,
+    /// Highlighting per card, with a fingerprint of the text it was computed from.
+    pub(crate) spans: HashMap<u64, (u64, Rc<Spans>)>,
     pub(crate) scrolls: HashMap<u64, ScrollHandle>,
     pub(crate) pending_bottom: HashSet<u64>,
     pub(crate) space: bool,
@@ -161,6 +163,8 @@ pub struct CanvasView {
     mtimes: HashMap<u64, SystemTime>,
     last_poll: Instant,
     inbox: Receiver<String>,
+    /// The canvas state is written by its own thread, so a save never stalls a frame.
+    saver: Sender<Saved>,
 }
 
 pub(crate) fn fl(p: Pixels) -> f32 { f32::from(p) }
@@ -225,6 +229,14 @@ impl CanvasView {
         let settings = Settings::load();
         let project = Arc::new(Project::new(root, settings.excluded()).expect("can't open the project folder"));
         let (tx, rx) = channel();
+        let (saver, to_save) = channel::<Saved>();
+        {
+            let (project, tx) = (project.clone(), tx.clone());
+            std::thread::spawn(move || while let Ok(mut s) = to_save.recv() {
+                while let Ok(newer) = to_save.try_recv() { s = newer; }
+                if let Err(e) = project.save_state(&s) { let _ = tx.send(Ev::SaveFailed(e.to_string())); }
+            });
+        }
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_millis(33)).await;
             if this.update(cx, |t, cx| if t.pump() { cx.notify(); }).is_err() { break; }
@@ -240,7 +252,7 @@ impl CanvasView {
             inputs: HashMap::new(), focus_input: None, editing: None, busy: HashMap::new(), tx, rx, explaining: HashMap::new(), explain_queue: None, menu: None, pick: None,
             models: None, show_settings: false, show_help: false, expanded: HashSet::new(), chat_open: true, explorer_open: true, hist_open: true, spans: HashMap::new(), scrolls: HashMap::new(),
             pending_bottom: HashSet::new(), space: false, toasts: Vec::new(), char_ratio, anim: HashMap::new(), fx: Fx::default(), side: (EXPLORER_W, CHAT_W), sel_at: Instant::now(), started: Instant::now(), focus, win_size: (1500., 950.), mouse: (0., 0.), mods: Default::default(),
-            state_dirty: None, mtimes: HashMap::new(), last_poll: Instant::now(), inbox,
+            state_dirty: None, mtimes: HashMap::new(), last_poll: Instant::now(), inbox, saver,
         };
         if let Some(s) = this.project.load_state() {
             this.doc = s.doc;
@@ -270,13 +282,10 @@ impl CanvasView {
     pub(crate) fn pv(&self, pane: u64) -> PaneView { self.views.get(&pane).copied().unwrap_or(self.views[&self.active]) }
     pub(crate) fn input(&mut self, k: Input) -> &mut TextBuffer { self.inputs.entry(k).or_default() }
     pub(crate) fn char_w(&self, z: f32) -> f32 { self.char_ratio * 12.5 * z }
-    /// Font size for code in a view. While a zoom is gliding it moves in quarter-pixel steps, so glyphs
-    /// are reused between frames instead of being rasterised afresh at every size on the way.
-    pub(crate) fn code_px(&self, pane: u64) -> f32 {
-        let p = self.pv(pane);
-        let s = 12.5 * p.v.z;
-        if (p.t.z - p.v.z).abs() > 1e-4 { ((s * 4.).round() / 4.).max(0.25) } else { s }
-    }
+    /// Glyph size for code at zoom `z`, in quarter-pixel steps: a zoom then reuses a bounded set of
+    /// rasterised glyphs instead of adding a new set for every size it passes through. Positions are not
+    /// stepped (see `paint_scaled`), so the text itself moves smoothly.
+    pub(crate) fn code_px(&self, z: f32) -> f32 { ((12.5 * z * 4.).round() / 4.).max(0.25) }
     pub(crate) fn scroll_handle(&mut self, id: u64) -> ScrollHandle { self.scrolls.entry(id).or_default().clone() }
 
     pub(crate) fn canvas_area(&self) -> (f32, f32, f32, f32) {
@@ -355,6 +364,7 @@ impl CanvasView {
             }
         };
         let id = self.doc.fresh_id();
+        let lines = Lines::new(lines); // shared with `disk` until the card is edited
         self.doc.cards.push(Card { id, title: rel.clone(), lang: rel.clone(), path: Some(rel), pane, x, y, w, disk: lines.clone(), lines, color: 0, talk: Talk::default(), ref_of: None, target: None, sel: None });
         self.touch();
     }
@@ -408,7 +418,8 @@ impl CanvasView {
         self.state_dirty = None;
         let views = self.views.iter().map(|(k, p)| (*k, p.t)).collect();
         let s = Saved { doc: self.doc.clone(), layout: self.layout.clone(), views, shared: self.shared, active: self.active };
-        if let Err(e) = self.project.save_state(&s) { self.toast(format!("Couldn't save the canvas: {e}"), true); }
+        // cloning the document is cheap: card text is shared, not copied
+        let _ = self.saver.send(s);
     }
 
     pub(crate) fn open_in_editor(&mut self, id: u64, line: usize) {
@@ -725,7 +736,7 @@ impl CanvasView {
                     if !moved && single.is_some() && self.live.is_none() {
                         let c = self.doc.card(single.unwrap()).unwrap();
                         self.fx.forget(Tw::Ghost);
-                        self.live = Some(Live { n: c.lines.len(), src: None, region: None, over: None, at: 0, ref_mode: false, lock: false, ghost_card: Some(c.id), lines: c.lines.clone(), lang: c.lang.clone(), title: c.title.clone(), color: c.color, gx: c.x, gy: c.y, gw: c.w, pane: c.pane });
+                        self.live = Some(Live { n: c.lines.len(), src: None, region: None, over: None, at: 0, ref_mode: false, lock: false, ghost_card: Some(c.id), lines: c.lines.to_vec(), lang: c.lang.clone(), title: c.title.clone(), color: c.color, gx: c.x, gy: c.y, gw: c.w, pane: c.pane });
                     }
                     moved = true;
                     let pane = self.pane_at(x, y).map_or(self.active, |r| r.id);
@@ -1092,7 +1103,7 @@ impl CanvasView {
         self.exit_edit();
         let (id, line, col) = match self.doc.card(id).and_then(|c| c.ref_of).and_then(|r| self.doc.region(r).cloned()) { Some(r) => (r.file, r.start, 0), None => (id, line, col) };
         let Some(c) = self.doc.card(id) else { return };
-        let mut b = TextBuffer::new(c.lines.clone());
+        let mut b = TextBuffer::new(c.lines.to_vec());
         b.set_cursor(line, col, false);
         self.inputs.insert(Input::Editor(id), b);
         self.editing = Some(id);
@@ -1104,10 +1115,10 @@ impl CanvasView {
         if self.focus_input == Some(Input::Editor(id)) { self.focus_input = None; }
         let Some(b) = self.inputs.remove(&Input::Editor(id)) else { return };
         let Some(c) = self.doc.card(id) else { return };
-        if c.lines == b.lines { return; }
+        if *c.lines == b.lines { return; }
         let is_file = c.is_file();
         self.snapshot();
-        if is_file { self.doc.set_file_lines(id, b.lines); } else { self.doc.card_mut(id).unwrap().lines = b.lines; }
+        if is_file { self.doc.set_file_lines(id, b.lines); } else { self.doc.card_mut(id).unwrap().lines = Lines::new(b.lines); }
         self.touch();
     }
 
@@ -1362,13 +1373,26 @@ impl CanvasView {
         while let Ok(ev) = self.rx.try_recv() { changed = true; self.handle_ev(ev); }
         if self.last_poll.elapsed() > Duration::from_millis(800) {
             self.last_poll = Instant::now();
+            let before: Vec<Lines> = self.doc.cards.iter().map(|c| c.lines.clone()).collect();
             self.reload_from_disk();
             self.doc.sync_refs();
+            changed |= before.len() != self.doc.cards.len() || before.iter().zip(&self.doc.cards).any(|(a, c)| !Arc::ptr_eq(a, &c.lines));
+            changed |= !self.toasts.is_empty(); // they fade and expire
             self.toasts.retain(|t| t.2.elapsed() < Duration::from_secs(5));
-            changed = true;
+            self.forget_closed();
         }
         if self.state_dirty.is_some_and(|t| t.elapsed() > Duration::from_millis(700)) { self.persist(); }
         changed
+    }
+
+    /// Drops caches that belong to cards and snippets which no longer exist.
+    fn forget_closed(&mut self) {
+        let alive: HashSet<u64> = self.doc.cards.iter().map(|c| c.id).chain(self.doc.regions.iter().map(|r| r.id)).chain([0, u64::MAX]).collect();
+        self.spans.retain(|id, _| alive.contains(id));
+        self.scrolls.retain(|id, _| alive.contains(id) || alive.contains(&id.wrapping_sub(1 << 40)) || *id == u64::MAX - 1);
+        self.mtimes.retain(|id, _| alive.contains(id));
+        self.fx.forget_except(&alive);
+        self.inputs.retain(|k, b| match k { Input::Chat(id) | Input::Ask(id) => alive.contains(id) && !b.is_empty(), _ => true });
     }
 
     fn handle_ev(&mut self, ev: Ev) {
@@ -1399,6 +1423,7 @@ impl CanvasView {
                 self.touch();
             }
             Ev::Models(m) => if self.models.is_some() { self.models = Some(m); },
+            Ev::SaveFailed(e) => self.toast(format!("Couldn't save the canvas: {e}"), true),
         }
     }
 
@@ -1541,9 +1566,24 @@ impl CanvasView {
     }
 
     pub(crate) fn set_spans(&mut self, id: u64, lines: &[String], lang: &str) {
-        if self.spans.get(&id).is_some_and(|(l, _)| l == lines) { return; }
-        self.spans.insert(id, (lines.to_vec(), Rc::new(highlight(lines, lang))));
+        let print = fingerprint(lines);
+        if self.spans.get(&id).is_some_and(|(p, _)| *p == print) { return; }
+        self.spans.insert(id, (print, Rc::new(highlight(lines, lang))));
     }
+}
+
+/// A quick 64-bit fingerprint of some lines (eight bytes at a time), to notice when text changed
+/// without keeping a second copy of it around to compare against.
+fn fingerprint(lines: &[String]) -> u64 {
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut h = (lines.len() as u64).wrapping_mul(K);
+    for l in lines {
+        h = (h ^ l.len() as u64).wrapping_mul(K);
+        let mut chunks = l.as_bytes().chunks_exact(8);
+        for c in &mut chunks { h = (h.rotate_left(27) ^ u64::from_le_bytes(c.try_into().unwrap())).wrapping_mul(K); }
+        for b in chunks.remainder() { h = (h.rotate_left(9) ^ *b as u64).wrapping_mul(K); }
+    }
+    h
 }
 
 pub(crate) fn visual_len(s: &str) -> usize { s.chars().map(|c| if c == '\t' { 4 } else { 1 }).sum() }

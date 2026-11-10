@@ -112,7 +112,12 @@ impl Project {
         fs::rename(tmp, file)
     }
 
-    pub fn load_state(&self) -> Option<Saved> { serde_json::from_slice(&fs::read(self.state_file()).ok()?).ok() }
+    pub fn load_state(&self) -> Option<Saved> {
+        let mut s: Saved = serde_json::from_slice(&fs::read(self.state_file()).ok()?).ok()?;
+        // an unedited file's text and its on-disk copy are one allocation again
+        for c in &mut s.doc.cards { if c.lines == c.disk { c.disk = c.lines.clone(); } }
+        Some(s)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
@@ -151,6 +156,18 @@ pub struct Target {
     pub replace: Option<(usize, usize)>, // 1-based inclusive
 }
 
+/// A card's text. Shared, so undo snapshots, the on-disk copy of an unedited file and every per-frame
+/// copy of a card point at the same lines; a write makes a private copy first ([`Arc::make_mut`]).
+pub type Lines = std::sync::Arc<Vec<String>>;
+
+/// Stored as a plain array of strings, exactly as before.
+mod shared_lines {
+    use super::Lines;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    pub fn serialize<S: Serializer>(v: &Lines, s: S) -> Result<S::Ok, S::Error> { v.as_ref().serialize(s) }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Lines, D::Error> { Vec::<String>::deserialize(d).map(Lines::new) }
+}
+
 /// A file on the canvas, or a floating snippet (`path` is `None`).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Card {
@@ -162,9 +179,11 @@ pub struct Card {
     pub x: f32,
     pub y: f32,
     pub w: f32,
-    pub lines: Vec<String>,
-    #[serde(default)]
-    pub disk: Vec<String>,
+    #[serde(with = "shared_lines")]
+    pub lines: Lines,
+    /// What is on disk; the very same lines as `lines` until the card is edited.
+    #[serde(default, with = "shared_lines")]
+    pub disk: Lines,
     pub color: u32,
     #[serde(default)]
     pub talk: Talk,
@@ -179,7 +198,9 @@ pub struct Card {
 
 impl Card {
     pub fn is_file(&self) -> bool { self.path.is_some() }
-    pub fn dirty(&self) -> bool { self.is_file() && self.lines != self.disk }
+    pub fn dirty(&self) -> bool { self.is_file() && !std::sync::Arc::ptr_eq(&self.lines, &self.disk) && self.lines != self.disk }
+    /// The lines, for changing: copies them first if anything else still shares them.
+    pub fn lines_mut(&mut self) -> &mut Vec<String> { std::sync::Arc::make_mut(&mut self.lines) }
     pub fn sel_range(&self) -> Option<(usize, usize)> { self.sel.map(|(a, b)| (a.min(b), a.max(b))) }
 }
 
@@ -197,6 +218,9 @@ pub struct Region {
     #[serde(default)]
     pub talk: Talk,
 }
+
+/// A snippet's place and looks, without its conversation.
+pub struct Mark { pub id: u64, pub start: usize, pub end: usize, pub color: u32, pub title: String }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Hist { pub added: bool, pub text: String, pub lines: usize, pub at: u64, pub reference: u64 }
@@ -262,6 +286,14 @@ impl Doc {
     pub fn region_mut(&mut self, id: u64) -> Option<&mut Region> { self.regions.iter_mut().find(|r| r.id == id) }
     pub fn file_by_path(&self, p: &str) -> Option<&Card> { self.cards.iter().find(|c| c.path.as_deref() == Some(p)) }
 
+    /// The same snippets as [`Self::regions_of`], in the same order, without their chats and drafts:
+    /// what drawing needs on every frame.
+    pub fn marks_of(&self, file: u64) -> Vec<Mark> {
+        let mut v: Vec<&Region> = self.regions.iter().filter(|r| r.file == file).collect();
+        v.sort_by_key(|r| (r.start, std::cmp::Reverse(r.end)));
+        v.into_iter().map(|r| Mark { id: r.id, start: r.start, end: r.end, color: r.color, title: r.title.clone() }).collect()
+    }
+
     pub fn regions_of(&self, file: u64) -> Vec<Region> {
         let mut v: Vec<Region> = self.regions.iter().filter(|r| r.file == file).cloned().collect();
         v.sort_by_key(|r| (r.start, std::cmp::Reverse(r.end)));
@@ -291,7 +323,7 @@ impl Doc {
             c.ref_of.map(|r| (i, self.region(r).map(|r| self.region_lines(r))))
         }).collect();
         for (i, lines) in snapshot {
-            match lines { Some(l) => self.cards[i].lines = l, None => self.cards[i].ref_of = None }
+            match lines { Some(l) => if *self.cards[i].lines != l { self.cards[i].lines = Lines::new(l); }, None => self.cards[i].ref_of = None }
         }
     }
 
@@ -331,8 +363,9 @@ impl Doc {
         // copy the mirrors before their sources disappear
         self.drop_regions(&dead);
         if let Some(f) = self.card_mut(file) {
-            f.lines.splice(at..at + del, ins);
-            if f.lines.is_empty() { f.lines.push(String::new()); }
+            let lines = f.lines_mut();
+            lines.splice(at..at + del, ins);
+            if lines.is_empty() { lines.push(String::new()); }
             f.sel = None;
         }
         self.sync_refs();
@@ -341,7 +374,7 @@ impl Doc {
     /// Replaces a file's lines through a common prefix/suffix diff, so regions survive edits.
     pub fn set_file_lines(&mut self, file: u64, next: Vec<String>) -> bool {
         let Some(old) = self.card(file).map(|f| f.lines.clone()) else { return false };
-        if old == next { return false; }
+        if *old == next { return false; }
         let p = old.iter().zip(&next).take_while(|(a, b)| a == b).count();
         let max = old.len().min(next.len()) - p;
         let s = old.iter().rev().zip(next.iter().rev()).take(max).take_while(|(a, b)| a == b).count();
@@ -353,11 +386,12 @@ impl Doc {
     pub fn apply_disk_text(&mut self, file: u64, text: &str) -> bool {
         let next = split_lines(text);
         let Some(c) = self.card(file) else { return false };
-        if next == c.disk { return false; }
+        if next == *c.disk { return false; }
         let was_dirty = c.dirty();
-        self.card_mut(file).unwrap().disk = next.clone();
-        if was_dirty { return false; }
+        if was_dirty { self.card_mut(file).unwrap().disk = Lines::new(next); return false; }
         self.set_file_lines(file, next);
+        let c = self.card_mut(file).unwrap();
+        c.disk = c.lines.clone();
         true
     }
 
@@ -374,7 +408,7 @@ impl Doc {
     fn new_floating(&mut self, title: String, lines: Vec<String>, lang: String, x: f32, y: f32, w: f32, pane: u64) -> Card {
         let color = self.fresh_color();
         let id = self.fresh_id();
-        Card { id, path: None, title, lang, pane, x, y, w, lines, disk: Vec::new(), color, talk: Talk::default(), ref_of: None, target: None, sel: None }
+        Card { id, path: None, title, lang, pane, x, y, w, lines: Lines::new(lines), disk: Lines::default(), color, talk: Talk::default(), ref_of: None, target: None, sel: None }
     }
 
     pub fn add_floating(&mut self, title: String, lines: Vec<String>, lang: String, x: f32, y: f32, w: f32, pane: u64, target: Option<Target>) -> u64 {
@@ -434,7 +468,7 @@ impl Doc {
         let c = self.cards.remove(s);
         let at = at.min(self.card(file).unwrap().lines.len());
         let n = c.lines.len();
-        self.splice(file, at, del, c.lines);
+        self.splice(file, at, del, std::sync::Arc::unwrap_or_clone(c.lines));
         self.regions.push(Region { id: c.id, file, start: at, end: at + n - 1, title: c.title, color: c.color, explained: false, talk: c.talk });
         true
     }
@@ -503,7 +537,7 @@ impl Doc {
         for id in rest {
             let c = self.card(*id)?.clone();
             let f = self.card_mut(*first)?;
-            f.lines.extend(c.lines);
+            f.lines_mut().extend(c.lines.iter().cloned());
             f.talk.chat.extend(c.talk.chat);
             self.remove_card(*id);
         }
@@ -519,12 +553,18 @@ impl Doc {
 
     pub fn base_lines(&self, id: u64) -> Vec<String> {
         if let Some(r) = self.region(id) { return self.region_lines(r); }
-        self.card(id).map(|c| c.lines.clone()).unwrap_or_default()
+        self.card(id).map(|c| c.lines.to_vec()).unwrap_or_default()
     }
 
     pub fn draft_stats(&self, id: u64) -> Option<(usize, usize)> {
         let owner = self.draft_owner(id);
         let draft = self.talk(owner)?.draft.as_ref()?;
+        // an untouched draft is the common case, and this runs for every draft tab on every frame
+        let same = match self.region(owner) {
+            Some(r) => self.card(r.file).is_some_and(|f| f.lines.get(r.start..=r.end).is_some_and(|l| l == draft.as_slice())),
+            None => self.card(owner).is_some_and(|c| *c.lines == *draft),
+        };
+        if same { return Some((0, 0)); }
         let ops = diff_lines(&self.base_lines(owner), draft);
         Some((ops.iter().filter(|o| matches!(o, Op::Add(_))).count(), ops.iter().filter(|o| matches!(o, Op::Del(_))).count()))
     }
@@ -538,7 +578,7 @@ impl Doc {
             self.talk_mut(owner).unwrap().draft = None;
             self.splice(r.file, r.start, n, next);
         } else if let Some(c) = self.card_mut(owner) {
-            c.lines = next;
+            c.lines = Lines::new(next);
             c.talk.draft = None;
         }
         self.sync_refs();
@@ -583,7 +623,7 @@ mod tests {
     fn doc(lines: &[&str]) -> (Doc, u64) {
         let mut d = Doc::default();
         let id = d.fresh_id();
-        d.cards.push(Card { id, path: Some("a.lua".into()), title: "a.lua".into(), lang: "a.lua".into(), pane: 1, x: 0., y: 0., w: 500., lines: s(lines), disk: s(lines), color: 0, talk: Talk::default(), ref_of: None, target: None, sel: None });
+        d.cards.push(Card { id, path: Some("a.lua".into()), title: "a.lua".into(), lang: "a.lua".into(), pane: 1, x: 0., y: 0., w: 500., lines: Lines::new(s(lines)), disk: Lines::new(s(lines)), color: 0, talk: Talk::default(), ref_of: None, target: None, sel: None });
         (d, id)
     }
 
@@ -618,11 +658,11 @@ mod tests {
         let (mut d, f) = doc(&["a", "b", "c", "d"]);
         let r = d.create_region(f, 1, 2, Some("mid".into()), false, vec![ChatMsg::new(Role::User, "hi")]);
         d.detach_region(r, 5., 5., 1).unwrap();
-        assert_eq!(d.card(f).unwrap().lines, s(&["a", "d"]));
+        assert_eq!(*d.card(f).unwrap().lines, s(&["a", "d"]));
         let c = d.card(r).unwrap();
-        assert_eq!((c.lines.clone(), c.talk.chat.len(), c.lang.as_str()), (s(&["b", "c"]), 1, "a.lua"));
+        assert_eq!((c.lines.to_vec(), c.talk.chat.len(), c.lang.as_str()), (s(&["b", "c"]), 1, "a.lua"));
         assert!(d.merge(r, f, 2, 0));
-        assert_eq!(d.card(f).unwrap().lines, s(&["a", "d", "b", "c"]));
+        assert_eq!(*d.card(f).unwrap().lines, s(&["a", "d", "b", "c"]));
         let m = d.region(r).unwrap();
         assert_eq!((m.start, m.end, m.talk.chat.len()), (2, 3, 1));
         assert!(d.card(r).is_none());
@@ -633,7 +673,7 @@ mod tests {
         let (mut d, f) = doc(&["a", "b", "c", "d"]);
         let r = d.create_region(f, 0, 1, None, false, vec![]);
         assert!(d.move_region(r, f, 2));
-        assert_eq!(d.card(f).unwrap().lines, s(&["c", "d", "a", "b"]));
+        assert_eq!(*d.card(f).unwrap().lines, s(&["c", "d", "a", "b"]));
         assert_eq!((d.region(r).unwrap().start, d.region(r).unwrap().end), (2, 3));
     }
 
@@ -644,10 +684,10 @@ mod tests {
         let c = d.make_reference(r, 0., 0., 1).unwrap();
         assert!(d.is_referenced(r));
         d.splice(f, 1, 1, s(&["B"]));
-        assert_eq!(d.card(c).unwrap().lines, s(&["B"]));
+        assert_eq!(*d.card(c).unwrap().lines, s(&["B"]));
         d.dissolve(&[r]);
         let card = d.card(c).unwrap();
-        assert_eq!((card.ref_of, card.lines.clone()), (None, s(&["B"])));
+        assert_eq!((card.ref_of, card.lines.to_vec()), (None, s(&["B"])));
     }
 
     #[test]
@@ -655,7 +695,7 @@ mod tests {
         let (mut d, f) = doc(&["a", "b", "c", "d", "e"]);
         let r = d.create_region(f, 1, 1, None, false, vec![]);
         d.move_lines(f, 0, 1, 3);
-        assert_eq!(d.card(f).unwrap().lines, s(&["c", "d", "e", "a", "b"]));
+        assert_eq!(*d.card(f).unwrap().lines, s(&["c", "d", "e", "a", "b"]));
         assert_eq!(d.region(r).unwrap().start, 4);
     }
 
@@ -677,17 +717,17 @@ mod tests {
         d.region_mut(r).unwrap().talk.draft = Some(s(&["B1", "B2"]));
         assert_eq!(d.draft_stats(c), Some((2, 1)));
         assert!(d.apply_draft(c));
-        assert_eq!(d.card(f).unwrap().lines, s(&["a", "B1", "B2", "c"]));
+        assert_eq!(*d.card(f).unwrap().lines, s(&["a", "B1", "B2", "c"]));
         assert_eq!(d.region(r).unwrap().end, 2);
-        assert_eq!(d.card(c).unwrap().lines, s(&["B1", "B2"]));
+        assert_eq!(*d.card(c).unwrap().lines, s(&["B1", "B2"]));
     }
 
     #[test]
     fn disk_changes_never_clobber_unsaved_edits() {
         let (mut d, f) = doc(&["a"]);
         assert!(d.apply_disk_text(f, "b\n"));
-        assert_eq!(d.card(f).unwrap().lines, s(&["b", ""]));
-        d.card_mut(f).unwrap().lines[0] = "mine".into();
+        assert_eq!(*d.card(f).unwrap().lines, s(&["b", ""]));
+        d.card_mut(f).unwrap().lines_mut()[0] = "mine".into();
         assert!(!d.apply_disk_text(f, "theirs"));
         assert_eq!(d.card(f).unwrap().lines[0], "mine");
     }

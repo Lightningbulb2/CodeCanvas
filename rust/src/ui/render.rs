@@ -39,6 +39,9 @@ pub(crate) fn shadow(y: f32, blur: f32, alpha: f32) -> BoxShadow { BoxShadow { c
 /// A crisp one-pixel ring (`0 0 0 1px color`).
 pub(crate) fn ring(color: Hsla) -> BoxShadow { BoxShadow { color, offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(1.) } }
 
+/// A text size in quarter-pixel steps, so zooming reuses a bounded set of rasterised glyphs.
+pub(crate) fn tpx(v: f32) -> Pixels { px(((v * 4.).round() / 4.).max(0.25)) }
+
 pub(crate) fn tok_color(t: Tok) -> Hsla {
     col(match t { Tok::Keyword => 0xc678dd, Tok::Str => 0x98c379, Tok::Num => 0xd19a66, Tok::Comment => 0x6b7280, Tok::Type => 0xe5c07b, Tok::Func => 0x61afef })
 }
@@ -75,13 +78,16 @@ fn text_runs(len: usize, hl: &[(Range<usize>, HighlightStyle)], base: &Font, ita
     out
 }
 
-/// Paints a line shaped at [`SHAPE_PX`] at `font_px`, colouring each glyph from the highlight ranges.
+/// Paints a line shaped at [`SHAPE_PX`]: glyphs are placed for a `pos_px` font (exactly what the zoom
+/// asks for, so text glides with its card) and drawn at `glyph_px` (the nearest quarter pixel, so the
+/// glyph cache stays small). Each glyph takes its colour from the highlight ranges.
 #[allow(clippy::too_many_arguments)]
-fn paint_scaled(line: &gpui::LineLayout, hl: &[(Range<usize>, HighlightStyle)], plain: Hsla, alpha: f32, origin: gpui::Point<Pixels>, line_height: Pixels, font_px: f32, window: &mut Window, cx: &mut gpui::App) {
-    let k = font_px / SHAPE_PX;
+fn paint_scaled(line: &gpui::LineLayout, hl: &[(Range<usize>, HighlightStyle)], plain: Hsla, alpha: f32, origin: gpui::Point<Pixels>, line_height: Pixels, glyph_px: f32, pos_px: f32, window: &mut Window) {
+    let k = pos_px / SHAPE_PX;
     let (ascent, descent) = (fl(line.ascent) * k, fl(line.descent) * k);
-    let baseline = origin.y + px((fl(line_height) - ascent - descent) / 2. + ascent);
-    let (mut h, size_px) = (0, px(font_px));
+    // whole-pixel baselines: otherwise each row rounds on its own and the rows jitter against each other
+    let baseline = px((fl(origin.y) + (fl(line_height) - ascent - descent) / 2. + ascent).round());
+    let (mut h, size_px) = (0, px(glyph_px));
     for run in &line.runs {
         for g in &run.glyphs {
             while h < hl.len() && g.index >= hl[h].0.end { h += 1; }
@@ -91,7 +97,6 @@ fn paint_scaled(line: &gpui::LineLayout, hl: &[(Range<usize>, HighlightStyle)], 
             let _ = if g.is_emoji { window.paint_emoji(at, run.font_id, g.id, size_px) } else { window.paint_glyph(at, run.font_id, g.id, size_px, color) };
         }
     }
-    let _ = cx;
 }
 
 fn dir_and_base(path: &str) -> (&str, &str) { path.rfind('/').map_or(("", path), |i| path.split_at(i + 1)) }
@@ -178,9 +183,9 @@ impl CanvasView {
             }
             rows.push(row);
         }
-        let font_px = self.code_px(pane);
+        let (font_px, pos_px) = (self.code_px(z), 12.5 * z);
         let (num_right, caret_w) = (gutter - 12. * z, (1.5 * z).max(1.));
-        layer = layer.child(canvas(|_, _, _| (), move |b: Bounds<Pixels>, _, window, cx| {
+        layer = layer.child(canvas(|_, _, _| (), move |b: Bounds<Pixels>, _, window, _| {
             let base = font(mono());
             let italic = base.clone().italic();
             let ts = window.text_system().clone();
@@ -190,9 +195,9 @@ impl CanvasView {
                 for bg in r.bg.into_iter().flatten() { window.paint_quad(fill(Bounds::new(origin, size(b.size.width, lh)), bg)); }
                 if let Some((x, w)) = r.sel { window.paint_quad(fill(Bounds::new(point(origin.x + px(x), origin.y), size(px(w), lh)), cola(SEL, 0.6))); }
                 let num = ts.layout_line(&r.num, px(SHAPE_PX), &text_runs(r.num.len(), &[], &base, &base), None);
-                paint_scaled(&num, &[], cola(MUTED, 0.7 * r.alpha), 1., point(origin.x + px(num_right - fl(num.width) * font_px / SHAPE_PX), origin.y), lh, font_px, window, cx);
+                paint_scaled(&num, &[], cola(MUTED, 0.7 * r.alpha), 1., point(origin.x + px(num_right - fl(num.width) * pos_px / SHAPE_PX), origin.y), lh, font_px, pos_px, window);
                 let code = ts.layout_line(&r.text, px(SHAPE_PX), &text_runs(r.text.len(), &r.hl, &base, &italic), None);
-                paint_scaled(&code, &r.hl, col(FG), r.alpha, point(origin.x + px(gutter), origin.y), lh, font_px, window, cx);
+                paint_scaled(&code, &r.hl, col(FG), r.alpha, point(origin.x + px(gutter), origin.y), lh, font_px, pos_px, window);
                 if let Some(x) = r.caret { window.paint_quad(fill(Bounds::new(point(origin.x + px(x), origin.y), size(px(caret_w), lh)), col(WARN))); }
             }
         }).absolute().size_full());
@@ -205,7 +210,7 @@ impl CanvasView {
         if self.editing == Some(card.id) { return Vec::new(); }
         let z = self.pv(pane).v.z;
         let mut out = Vec::new();
-        for r in self.doc.regions_of(card.id) {
+        for r in self.doc.marks_of(card.id) {
             let gone = self.live.as_ref().is_some_and(|l| !l.ref_mode && l.src.is_some_and(|s| s.0 == card.id && match l.region { Some(id) => id == r.id, None => r.start >= s.1 && r.end <= s.2 }));
             if gone { continue; }
             let y = (HEAD + PAD + r.start as f32 * LH + self.line_shift(card.id, r.start)) * z;
@@ -292,17 +297,17 @@ impl CanvasView {
                 .child(div().text_color(col(MUTED)).child(dir.to_string())).child(div().font_weight(FontWeight::MEDIUM).child(base.to_string())).into_any_element()
         } else {
             div().flex_1().min_w_0().flex().gap(px(8. * z)).overflow_hidden().whitespace_nowrap()
-                .child(div().font_weight(FontWeight::MEDIUM).child(card.title.clone())).child(div().text_color(col(MUTED)).text_size(px(11. * z)).font_family(mono()).child(sub)).into_any_element()
+                .child(div().font_weight(FontWeight::MEDIUM).child(card.title.clone())).child(div().text_color(col(MUTED)).text_size(tpx(11. * z)).font_family(mono()).child(sub)).into_any_element()
         };
         let ico = if is_file { div().bg(col(ext_color(&card.title))).rounded(px(2. * z)) }
             else if card.ref_of.is_some() { div().border_2().border_color(col(card.color)).rounded_full() }
             else { div().bg(col(card.color)).rounded_full() };
         let bg = if is_file { col(HEADC) } else { mix(card.color, HEADC, 0.13) };
         div().relative().flex().items_center().gap(px(7. * z)).h(px(HEAD * z)).pl(px(11. * z)).pr(px(6. * z)).bg(bg).rounded_t(px((9. * z - 1.).max(0.))).border_b_1().border_color(col(BORDER))
-            .text_size(px(12.5 * z)).text_color(col(FG)).cursor_grab()
+            .text_size(tpx(12.5 * z)).text_color(col(FG)).cursor_grab()
             .child(ico.size(px(9. * z)).flex_none()).child(title)
             .when(card.dirty(), |d| d.child(div().size(px(8. * z)).flex_none().rounded_full().bg(col(FG))))
-            .when(editing, |d| d.child(div().flex_none().text_size(px(10. * z)).text_color(col(WARN)).whitespace_nowrap().child("EDITING · Esc to finish · Ctrl+S to save")))
+            .when(editing, |d| d.child(div().flex_none().text_size(tpx(10. * z)).text_color(col(WARN)).whitespace_nowrap().child("EDITING · Esc to finish · Ctrl+S to save")))
             .child(tools)
             .on_mouse_down(MouseButton::Left, cx.listener(move |t, e: &MouseDownEvent, _, cx| {
                 if e.click_count >= 2 && t.doc.card(id).is_some_and(|c| !c.is_file()) { cx.stop_propagation(); t.begin_rename(id); cx.notify(); return; }
@@ -333,7 +338,7 @@ impl CanvasView {
             let settled = !self.fx.slides.contains_key(&src.id) && self.editing != Some(src.id);
             if settled && (ry > vh + 2100. * z || ry + rh < -700. || rx > vw + 1000. || rx + src.w * z + 1000. * z < 0.) { continue; }
             let c = &if z < FAR_Z {
-                Card { id: src.id, path: src.path.clone(), title: src.title.clone(), lang: String::new(), pane: src.pane, x: src.x, y: src.y, w: src.w, lines: Vec::new(), disk: Vec::new(), color: src.color, talk: Talk::default(), ref_of: src.ref_of, target: None, sel: None }
+                Card { id: src.id, path: src.path.clone(), title: src.title.clone(), lang: String::new(), pane: src.pane, x: src.x, y: src.y, w: src.w, lines: Default::default(), disk: Default::default(), color: src.color, talk: Talk::default(), ref_of: src.ref_of, target: None, sel: None }
             } else { src.clone() };
             if ghost_card == Some(c.id) && over.is_some() { continue; } // drawn inside its slot
             let (alpha, rise) = self.fx.card(c.id);
@@ -359,8 +364,8 @@ impl CanvasView {
                 let name = if c.ref_of.is_some() { format!("↗ {}", c.title) } else { base.to_string() };
                 let small = if c.is_file() { format!("{dir} · {n_lines} lines") } else { format!("{n_lines} lines") };
                 out.push(self.card_box(sx, sy, sw, sh, z, border).bg(cola(CARD, 0.92)).flex().flex_col().items_center().justify_center().gap(px(2.)).px(px(6.))
-                    .child(div().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).text_color(col(if c.is_file() { FG } else { c.color })).whitespace_nowrap().child(name))
-                    .when(sh > 44., |d| d.child(div().text_size(px(11.)).text_color(col(MUTED)).whitespace_nowrap().child(small))).into_any_element());
+                    .child(div().text_size(tpx(15.)).font_weight(FontWeight::SEMIBOLD).text_color(col(if c.is_file() { FG } else { c.color })).whitespace_nowrap().child(name))
+                    .when(sh > 44., |d| d.child(div().text_size(tpx(11.)).text_color(col(MUTED)).whitespace_nowrap().child(small))).into_any_element());
                 continue;
             }
             let id = c.id;
@@ -415,7 +420,7 @@ impl CanvasView {
         let spans = self.spans[&id].1.clone();
         let gutter = self.gutter(slot.map_or(lines.len().max(100), |s| s.1)) * z;
         let lh = LH * z;
-        let mut body = div().absolute().left_0().top(px(HEAD * z)).w_full().font_family(mono()).text_size(px(12.5 * z)).line_height(px(lh));
+        let mut body = div().absolute().left_0().top(px(HEAD * z)).w_full().font_family(mono()).text_size(tpx(12.5 * z)).line_height(px(lh));
         for (i, line) in lines.iter().enumerate().take(400) {
             let (text, hl) = display_line(line, spans.get(i));
             let no = if slot.is_some() { at + i + 1 } else { i + 1 };
@@ -424,7 +429,7 @@ impl CanvasView {
                 .child(div().flex_1().text_color(col(FG)).whitespace_nowrap().overflow_hidden().child(StyledText::new(text).with_highlights(hl))));
         }
         let h = (HEAD + PAD * 2. + n as f32 * LH) * z;
-        let head = div().h(px(HEAD * z)).pl(px(11. * z)).flex().items_center().gap(px(7. * z)).text_size(px(12.5 * z)).text_color(col(FG)).bg(mix(color, HEADC, 0.13)).border_b_1().border_color(col(BORDER))
+        let head = div().h(px(HEAD * z)).pl(px(11. * z)).flex().items_center().gap(px(7. * z)).text_size(tpx(12.5 * z)).text_color(col(FG)).bg(mix(color, HEADC, 0.13)).border_b_1().border_color(col(BORDER))
             .when(docked, |d| d.opacity(0.))
             .child(div().size(px(9. * z)).flex_none().rounded_full().bg(col(color))).child(div().font_weight(FontWeight::MEDIUM).child(if is_sel { format!("{n} line{}", if n == 1 { "" } else { "s" }) } else { title }));
         let border = if is_sel { col(ACCENT) } else { mix(color, BORDER, 0.55) };
@@ -441,7 +446,7 @@ impl CanvasView {
             self.chat_stack(c.id, "Chat".to_string(), ACCENT, false, x, sy + 6. * z, pane, z, cx, &mut out);
             let mut last = 30.;
             if self.editing != Some(c.id) {
-                for r in self.doc.regions_of(c.id) {
+                for r in self.doc.marks_of(c.id) {
                     let gone = self.live.as_ref().is_some_and(|l| l.region == Some(r.id) && !l.ref_mode);
                     if gone { continue; }
                     let top = f32::max(HEAD + PAD + r.start as f32 * LH + self.line_shift(c.id, r.start), last + 2.);
@@ -458,20 +463,20 @@ impl CanvasView {
     /// A margin tab: arrow (turns as its drawer opens), label, and whatever else is passed in.
     fn tab_el(&self, color: u32, open: f32, z: f32) -> Div {
         div().flex().flex_none().items_center().gap(px(5. * z)).h(px(22. * z)).max_w(px(220. * z)).pl(px(6. * z)).pr(px(9. * z)).bg(col(HEADC)).border_1().border_l_0().border_color(col(BORDER)).rounded_r(px(7. * z))
-            .text_size(px(11.5 * z)).text_color(col(MUTED)).whitespace_nowrap().overflow_hidden().cursor_pointer().hover(|s| s.bg(col(HOVER)).text_color(col(FG)))
+            .text_size(tpx(11.5 * z)).text_color(col(MUTED)).whitespace_nowrap().overflow_hidden().cursor_pointer().hover(|s| s.bg(col(HOVER)).text_color(col(FG)))
             .child(icon("tri", 8. * z, col(color)).with_transformation(Transformation::rotate(radians(open * std::f32::consts::PI))))
     }
 
     /// One owner's column beside its card: the chat tab with its drawer, then the draft tab with its drawer.
     #[allow(clippy::too_many_arguments)]
     fn chat_stack(&mut self, id: u64, label: String, color: u32, has_draft: bool, x: f32, y: f32, pane: u64, z: f32, cx: &mut Context<Self>, out: &mut Vec<AnyElement>) {
-        let Some(talk) = self.doc.talk(id).cloned() else { return };
+        let Some(talk) = self.doc.talk(id) else { return };
+        let (talk_open, draft_open, has_chat) = (talk.open, talk.draft_open, talk.chat.iter().any(|m| m.role != Role::Note));
         let fade = self.fx.fresh_alpha(id);
         if fade <= 0.01 { return; }
         let is_region = self.doc.region(id).is_some();
         let is_file = self.doc.card(id).is_some_and(Card::is_file);
-        let has_chat = talk.chat.iter().any(|m| m.role != Role::Note);
-        let open = self.fx.tween(Tw::Drawer(id), if talk.open { 1. } else { 0. }, 280.);
+        let open = self.fx.tween(Tw::Drawer(id), if talk_open { 1. } else { 0. }, 280.);
         let renaming = is_region && self.focus_input == Some(Input::Rename(id));
         let mut chat_tab = self.tab_el(color, open, z).when(is_region, |d| d.cursor_grab());
         chat_tab = if renaming {
@@ -494,10 +499,10 @@ impl CanvasView {
         }
         let mut stack = div().absolute().left(px(x)).top(px(y)).flex().flex_col().items_start().gap(px(2. * z)).when(fade < 1., |d| d.opacity(fade)).child(chat_row);
         if has_draft {
-            let dopen = self.fx.tween(Tw::Draft(id), if talk.draft_open { 1. } else { 0. }, 280.);
+            let dopen = self.fx.tween(Tw::Draft(id), if draft_open { 1. } else { 0. }, 280.);
             let stats = self.doc.draft_stats(id).filter(|(a, d)| *a + *d > 0);
-            let dt = self.tab_el(color, dopen, z).text_size(px(11. * z)).when(stats.is_some(), |d| d.text_color(col(FG))).child("✎ Draft")
-                .when_some(stats, |d, (a, del)| d.child(div().flex().gap(px(4. * z)).font_family(mono()).text_size(px(10.5 * z)).font_weight(FontWeight::SEMIBOLD)
+            let dt = self.tab_el(color, dopen, z).text_size(tpx(11. * z)).when(stats.is_some(), |d| d.text_color(col(FG))).child("✎ Draft")
+                .when_some(stats, |d, (a, del)| d.child(div().flex().gap(px(4. * z)).font_family(mono()).text_size(tpx(10.5 * z)).font_weight(FontWeight::SEMIBOLD)
                     .child(div().text_color(col(OK)).child(format!("+{a}"))).child(div().text_color(col(BAD)).child(format!("−{del}")))))
                 .on_any_mouse_down(cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()))
                 .on_mouse_down(MouseButton::Left, cx.listener(move |t, _: &MouseDownEvent, _, cx| { t.toggle_draft(id); cx.notify(); }));
@@ -526,7 +531,7 @@ impl CanvasView {
                 .on_mouse_down(MouseButton::Left, cx.listener(move |t, _: &MouseDownEvent, w, cx| { cx.stop_propagation(); f(t, w, cx); cx.notify(); }))
         };
         let pane_id = c.pane;
-        Some(div().absolute().left(px(x)).top(px(y)).flex().gap(px(2.)).p(px(3.)).bg(col(CARD)).border_1().border_color(col(BORDER)).rounded(px(7.)).shadow(vec![shadow(8., 24., 0.47)]).text_size(px(12.)).text_color(col(FG)).opacity(p)
+        Some(div().absolute().left(px(x)).top(px(y)).flex().gap(px(2.)).p(px(3.)).bg(col(CARD)).border_1().border_color(col(BORDER)).rounded(px(7.)).shadow(vec![shadow(8., 24., 0.47)]).text_size(tpx(12.)).text_color(col(FG)).opacity(p)
             .child(btn("◆ Snippet", cx, Rc::new(move |t, _, _| { t.make_selection_region(id); })))
             .child(btn("✂ Detach", cx, Rc::new(move |t, _, _| { if let Some(r) = t.make_selection_region(id) { t.detach_fx(r, spot.0, spot.1, pane_id); t.touch(); } })))
             .child(btn("↗ Reference", cx, Rc::new(move |t, _, _| { if let Some(r) = t.make_selection_region(id) { t.reference_fx(r, spot.0, spot.1, pane_id); t.touch(); } })))
@@ -586,14 +591,14 @@ impl CanvasView {
         let fades: Vec<AnyElement> = self.fx.fades.iter().filter(|f| self.shared || f.pane == pane).map(|f| {
             let (x, y) = on_screen(f.x, f.y);
             self.card_box(x, y, f.w * v.z, f.h * v.z, v.z, mix(f.color, BORDER, 0.55)).opacity(1. - ease_out(ms_since(f.at) / 250.))
-                .child(div().h(px(HEAD * v.z)).pl(px(11. * v.z)).flex().items_center().bg(mix(f.color, HEADC, 0.13)).text_size(px(12.5 * v.z)).child(f.title.clone())).into_any_element()
+                .child(div().h(px(HEAD * v.z)).pl(px(11. * v.z)).flex().items_center().bg(mix(f.color, HEADC, 0.13)).text_size(tpx(12.5 * v.z)).child(f.title.clone())).into_any_element()
         }).collect();
         // lines flying between cards
         let mut flies: Vec<AnyElement> = Vec::new();
         for f in self.fx.flies.iter().filter(|f| self.shared || f.pane == pane) {
             for (k, (text, hl)) in f.rows.iter().enumerate() {
                 let (x, y) = on_screen(f.pos(k).0, f.pos(k).1);
-                flies.push(div().absolute().left(px(x)).top(px(y)).h(px(LH * v.z)).pr(px(8. * v.z)).rounded(px(3. * v.z)).bg(mix(f.color, CARD, 0.18)).font_family(mono()).text_size(px(12.5 * v.z)).line_height(px(LH * v.z))
+                flies.push(div().absolute().left(px(x)).top(px(y)).h(px(LH * v.z)).pr(px(8. * v.z)).rounded(px(3. * v.z)).bg(mix(f.color, CARD, 0.18)).font_family(mono()).text_size(tpx(12.5 * v.z)).line_height(px(LH * v.z))
                     .text_color(col(FG)).whitespace_nowrap().child(StyledText::new(text.clone()).with_highlights(hl.clone())).into_any_element());
             }
         }
@@ -611,7 +616,7 @@ impl CanvasView {
             }
             div().absolute().left(px(x)).top(px(y - 1.5)).w(px(c.w * v.z)).h(px(3.)).rounded(px(2.)).bg(col(SNIP)).shadow(vec![BoxShadow { color: cola(SNIP, 0.8), offset: point(px(0.), px(0.)), blur_radius: px(12.), spread_radius: px(0.) }])
                 .child(div().absolute().left(px(-5.)).top(px(-4.)).size(px(11.)).rounded_full().bg(col(SNIP)))
-                .child(div().absolute().right(px(8.)).top(px(-20.)).px(px(7.)).py(px(1.)).rounded(px(4.)).bg(col(SNIP)).text_color(col(0xffffff)).text_size(px(11.)).whitespace_nowrap()
+                .child(div().absolute().right(px(8.)).top(px(-20.)).px(px(7.)).py(px(1.)).rounded(px(4.)).bg(col(SNIP)).text_color(col(0xffffff)).text_size(tpx(11.)).whitespace_nowrap()
                     .child(format!("merge {count} snippet{} at line {}", if count == 1 { "" } else { "s" }, at + 1)))
         });
         let group: SharedString = format!("pane{pane}").into();
@@ -635,7 +640,7 @@ impl CanvasView {
     fn edge_toggle(&self, left: bool, open: bool, cx: &mut Context<Self>) -> Div {
         let (x, y, w, h) = self.canvas_area();
         let arrow = if left == open { "◀" } else { "▶" };
-        div().absolute().top(px(y + h / 2. - 22.)).w(px(14.)).h(px(44.)).flex().items_center().justify_center().bg(col(PANEL)).border_1().border_color(col(PANEL_BORDER)).text_size(px(9.)).text_color(col(MUTED))
+        div().absolute().top(px(y + h / 2. - 22.)).w(px(14.)).h(px(44.)).flex().items_center().justify_center().bg(col(PANEL)).border_1().border_color(col(PANEL_BORDER)).text_size(tpx(9.)).text_color(col(MUTED))
             .cursor_pointer().hover(|s| s.text_color(col(FG)))
             .when(left, |d| d.left(px(x)).border_l_0().rounded_r(px(6.))).when(!left, |d| d.left(px(x + w - 14.)).border_r_0().rounded_l(px(6.)))
             .child(arrow)
@@ -678,7 +683,7 @@ impl Render for CanvasView {
         if std::mem::take(&mut self.fx.want_frame) { window.request_animation_frame(); }
         div().id("root").track_focus(&self.focus).on_key_down(cx.listener(Self::on_key)).on_key_up(cx.listener(Self::on_key_up))
             .on_mouse_move(cx.listener(Self::on_move)).on_mouse_up(MouseButton::Left, cx.listener(Self::on_up)).on_mouse_up(MouseButton::Middle, cx.listener(Self::on_up))
-            .relative().size_full().bg(col(BG)).text_color(col(FG)).text_size(px(13.))
+            .relative().size_full().bg(col(BG)).text_color(col(FG)).text_size(tpx(13.))
             .children(panes).children(sash_els).child(top).children(explorer).children(chat).children(toggles).child(ctx).children(overlays)
     }
 }

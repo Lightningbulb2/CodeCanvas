@@ -69,7 +69,7 @@ fn md_blocks(text: &str, z: f32) -> Div {
         let hashes = t.chars().take_while(|c| *c == '#').count();
         let numbered = t.find(['.', ')']).filter(|i| *i > 0 && *i <= 3 && t[..*i].chars().all(|c| c.is_ascii_digit()) && t[*i + 1..].starts_with(' '));
         if (1..=4).contains(&hashes) && t[hashes..].starts_with(' ') {
-            row = row.mt(px(4. * z)).font_weight(FontWeight::SEMIBOLD).text_size(px(13. * z)).child(line(t[hashes..].trim()));
+            row = row.mt(px(4. * z)).font_weight(FontWeight::SEMIBOLD).text_size(tpx(13. * z)).child(line(t[hashes..].trim()));
         } else if let Some(item) = t.strip_prefix("- ").or_else(|| t.strip_prefix("* ")) {
             row = row.flex().gap(px(6. * z)).pl(px(6. * z)).child(div().flex_none().text_color(col(MUTED)).child("•")).child(div().flex_1().min_w_0().child(line(item)));
         } else if let Some(i) = numbered {
@@ -107,7 +107,7 @@ impl CanvasView {
         let lh = size * 1.45;
         let cw = self.char_ratio * size;
         let k2 = key.clone();
-        let mut d = div().relative().w_full().font_family(mono()).text_size(px(size)).line_height(px(lh)).min_h(px(lh)).cursor_text()
+        let mut d = div().relative().w_full().font_family(mono()).text_size(tpx(size)).line_height(px(lh)).min_h(px(lh)).cursor_text()
             .on_mouse_down(MouseButton::Left, cx.listener(move |t, _: &MouseDownEvent, _, cx| { cx.stop_propagation(); t.exit_edit_unless(&k2); t.focus_input = Some(k2.clone()); cx.notify(); }));
         if b.is_empty() && !focused { return d.text_color(col(MUTED)).child(placeholder.to_string()); }
         for (i, l) in b.lines.iter().enumerate() {
@@ -149,7 +149,7 @@ impl CanvasView {
             .child(tb(Some("fit"), "", false, cx, |t, _, _| { let a = t.active; t.fit(a); }))
             .child(tb(Some("splitR"), "", false, cx, |t, _, _| t.split(true)))
             .child(tb(Some("splitD"), "", false, cx, |t, _, _| t.split(false)))
-            .child(div().flex().flex_none().items_center().gap(px(5.)).px(px(8.)).h(px(26.)).rounded(px(5.)).cursor_pointer().text_size(px(12.)).text_color(col(MUTED)).whitespace_nowrap().hover(|s| s.bg(col(HOVER)).text_color(col(FG)))
+            .child(div().flex().flex_none().items_center().gap(px(5.)).px(px(8.)).h(px(26.)).rounded(px(5.)).cursor_pointer().text_size(tpx(12.)).text_color(col(MUTED)).whitespace_nowrap().hover(|s| s.bg(col(HOVER)).text_color(col(FG)))
                 .child(check).child("Shared canvas")
                 .on_mouse_down(MouseButton::Left, cx.listener(move |t, _: &MouseDownEvent, _, cx| { cx.stop_propagation(); t.set_shared(!shared); cx.notify(); })))
             .child(div().flex().flex_none().items_center().gap(px(6.)).px(px(9.)).h(px(26.)).rounded(px(5.)).border_1().border_color(gpui::transparent_black()).cursor_pointer().whitespace_nowrap()
@@ -162,46 +162,73 @@ impl CanvasView {
     }
 
     pub(crate) fn explorer(&mut self, cx: &mut Context<Self>) -> Div {
+        const ROW: f32 = 22.;
+        enum Entry<'a> { Dir { depth: usize, name: &'a str, path: String, open: bool }, File { depth: usize, label: &'a str, path: &'a str } }
         let filter = self.inputs.get(&Input::Filter).map(|b| b.text().to_lowercase()).unwrap_or_default();
-        let mut list = div().id("tree").flex_1().overflow_y_scroll().px(px(4.)).pb(px(12.)).text_size(px(13.));
-        let open: HashSet<String> = self.doc.cards.iter().filter_map(|c| c.path.clone()).collect();
-        let row = |depth: usize, cx: &mut Context<Self>| div().h(px(22.)).flex_none().pl(px(6. + depth as f32 * 12.)).pr(px(6.)).flex().items_center().gap(px(5.)).rounded(px(4.)).whitespace_nowrap().overflow_hidden().hover(|s| s.bg(col(HOVER))).cursor_pointer()
-            .on_any_mouse_down(cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()));
-        let file_row = |p: &str, label: String, depth: usize, is_open: bool, cx: &mut Context<Self>| {
-            let (a, b) = (p.to_string(), p.to_string());
-            row(depth, cx).child(div().w(px(12.)).flex_none()).child(div().size(px(8.)).flex_none().rounded(px(2.)).bg(col(ext_color(p)))).child(div().text_color(col(if is_open { ACCENT } else { FG })).child(label))
-                .on_mouse_down(MouseButton::Left, cx.listener(move |t, e: &MouseDownEvent, _, _| { t.drag = Some(Drag::Explorer { path: a.clone(), sx: fl(e.position.x), sy: fl(e.position.y), moved: false }); }))
-                .on_mouse_down(MouseButton::Right, cx.listener(move |t, e: &MouseDownEvent, _, cx| { t.explorer_menu(b.clone(), fl(e.position.x), fl(e.position.y)); cx.notify(); }))
-        };
+        // The tree is borrowed for the frame (not copied) and only the rows in view become elements.
+        let tree = std::mem::take(&mut self.tree);
+        let mut entries: Vec<Entry> = Vec::new();
         if !filter.is_empty() {
-            for p in self.tree.iter().filter(|p| p.to_lowercase().contains(&filter)).take(400) { list = list.child(file_row(p, p.clone(), 0, open.contains(p), cx)); }
+            entries.extend(tree.iter().filter(|p| p.to_lowercase().contains(&filter)).take(400).map(|p| Entry::File { depth: 0, label: p, path: p }));
         } else {
-            let tree = self.tree.clone();
             let mut last_dirs: Vec<&str> = Vec::new();
-            let mut shown = 0;
             'files: for p in &tree {
                 let parts: Vec<&str> = p.split('/').collect();
                 let mut prefix = String::new();
                 for (d, seg) in parts[..parts.len() - 1].iter().enumerate() {
                     if !prefix.is_empty() { prefix.push('/'); }
                     prefix.push_str(seg);
+                    let open = self.expanded.contains(&prefix);
                     if last_dirs.get(d) != Some(seg) || last_dirs.len() <= d {
                         last_dirs.truncate(d);
                         last_dirs.push(seg);
-                        let is_open = self.expanded.contains(&prefix);
-                        let turn = self.fx.tween(Tw::Dir(crate::model::hash_str(&prefix)), if is_open { 1. } else { 0. }, 150.);
-                        let key = prefix.clone();
-                        list = list.child(row(d, cx).child(icon("chev", 12., col(MUTED)).with_transformation(Transformation::rotate(radians(turn * std::f32::consts::FRAC_PI_2)))).child(seg.to_string())
-                            .on_mouse_down(MouseButton::Left, cx.listener(move |t, _: &MouseDownEvent, _, cx| { if !t.expanded.remove(&key) { t.expanded.insert(key.clone()); } cx.notify(); })));
+                        entries.push(Entry::Dir { depth: d, name: seg, path: prefix.clone(), open });
                     }
-                    if !self.expanded.contains(&prefix) { continue 'files; }
+                    if !open { continue 'files; }
                 }
                 last_dirs.truncate(parts.len() - 1);
-                list = list.child(file_row(p, parts[parts.len() - 1].to_string(), parts.len() - 1, open.contains(p), cx));
-                shown += 1;
-                if shown > 3000 { break; }
+                entries.push(Entry::File { depth: parts.len() - 1, label: parts[parts.len() - 1], path: p });
             }
         }
+        let handle = self.scroll_handle(u64::MAX - 1);
+        let (first, last) = { let top = (-fl(handle.offset().y)).max(0.); (((top / ROW) as usize).saturating_sub(6), (((top + self.win_size.1) / ROW) as usize + 6).min(entries.len())) };
+        let first = first.min(last);
+        let on_canvas: HashSet<&str> = self.doc.cards.iter().filter_map(|c| c.path.as_deref()).collect();
+        let row = |depth: usize, cx: &mut Context<Self>| div().h(px(ROW)).flex_none().pl(px(6. + depth as f32 * 12.)).pr(px(6.)).flex().items_center().gap(px(5.)).rounded(px(4.)).whitespace_nowrap().overflow_hidden().hover(|s| s.bg(col(HOVER))).cursor_pointer()
+            .on_any_mouse_down(cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()));
+        let mut rows: Vec<Div> = Vec::with_capacity(last - first);
+        let mut turns: Vec<(u64, bool)> = Vec::new();
+        for e in &entries[first..last] {
+            rows.push(match e {
+                Entry::Dir { depth, name, path, open } => {
+                    turns.push((crate::model::hash_str(path), *open));
+                    let key = path.clone();
+                    row(*depth, cx).child(div().w(px(12.)).flex_none()).child(name.to_string())
+                        .on_mouse_down(MouseButton::Left, cx.listener(move |t, _: &MouseDownEvent, _, cx| { if !t.expanded.remove(&key) { t.expanded.insert(key.clone()); } cx.notify(); }))
+                }
+                Entry::File { depth, label, path } => {
+                    let (a, b) = (path.to_string(), path.to_string());
+                    row(*depth, cx).child(div().w(px(12.)).flex_none()).child(div().size(px(8.)).flex_none().rounded(px(2.)).bg(col(ext_color(path)))).child(div().text_color(col(if on_canvas.contains(path) { ACCENT } else { FG })).child(label.to_string()))
+                        .on_mouse_down(MouseButton::Left, cx.listener(move |t, e: &MouseDownEvent, _, _| { t.drag = Some(Drag::Explorer { path: a.clone(), sx: fl(e.position.x), sy: fl(e.position.y), moved: false }); }))
+                        .on_mouse_down(MouseButton::Right, cx.listener(move |t, e: &MouseDownEvent, _, cx| { t.explorer_menu(b.clone(), fl(e.position.x), fl(e.position.y)); cx.notify(); }))
+                }
+            });
+        }
+        let is_dir: Vec<bool> = entries[first..last].iter().map(|e| matches!(e, Entry::Dir { .. })).collect();
+        let (above, below) = (first as f32 * ROW, (entries.len() - last) as f32 * ROW);
+        drop(on_canvas);
+        drop(entries);
+        self.tree = tree;
+        // folder chevrons turn as they open
+        let mut turns = turns.into_iter();
+        let rows: Vec<Div> = rows.into_iter().zip(is_dir).map(|(r, dir)| {
+            if !dir { return r; }
+            let (key, open) = turns.next().unwrap();
+            let turn = self.fx.tween(Tw::Dir(key), if open { 1. } else { 0. }, 150.);
+            r.relative().child(icon("chev", 12., col(MUTED)).absolute().top(px(5.)).with_transformation(Transformation::rotate(radians(turn * std::f32::consts::FRAC_PI_2))))
+        }).collect();
+        let list = div().id("tree").flex_1().overflow_y_scroll().track_scroll(&handle).px(px(4.)).pb(px(12.)).text_size(px(13.))
+            .child(div().h(px(above)).flex_none()).children(rows).child(div().h(px(below)).flex_none());
         let focused = self.focus_input == Some(Input::Filter);
         let filter_el = self.input_el(Input::Filter, "Filter files…", 12.5, cx);
         div().w(px(EXPLORER_W)).h_full().flex().flex_col().bg(col(PANEL)).border_r_1().border_color(col(PANEL_BORDER))
@@ -216,7 +243,7 @@ impl CanvasView {
             Role::Error => return div().text_color(col(BAD)).child(content.to_string()),
             Role::Note => {
                 return div().bg(cola(SNIP, 0.16)).rounded(px(7. * z)).px(px(10. * z)).py(px(7. * z))
-                    .child(div().mb(px(2. * z)).text_size(px(10.5 * z)).text_color(col(MUTED)).child(title.unwrap_or("Explanation".into()).to_uppercase())).child(md_blocks(content, z));
+                    .child(div().mb(px(2. * z)).text_size(tpx(10.5 * z)).text_color(col(MUTED)).child(title.unwrap_or("Explanation".into()).to_uppercase())).child(md_blocks(content, z));
             }
             Role::Assistant => {}
         }
@@ -229,17 +256,17 @@ impl CanvasView {
                     let a = agent::attrs(&info);
                     let get = |k: &str| a.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
                     let wh = match get("file") { Some(f) => format!("{f}{}", get("replace").or(get("insert")).map_or(String::new(), |x| format!(":{x}"))), None => if is_snippet { "→ draft".into() } else { "unplaced".into() } };
-                    d = d.child(div().flex().items_center().gap(px(7. * z)).px(px(9. * z)).py(px(6. * z)).border_1().border_color(cola(SNIP, 0.45)).bg(cola(SNIP, 0.16)).rounded(px(7. * z)).text_size(px(12. * z))
+                    d = d.child(div().flex().items_center().gap(px(7. * z)).px(px(9. * z)).py(px(6. * z)).border_1().border_color(cola(SNIP, 0.45)).bg(cola(SNIP, 0.16)).rounded(px(7. * z)).text_size(tpx(12. * z))
                         .child(div().text_color(col(SNIP)).child("◆")).child(div().flex_1().font_weight(FontWeight::MEDIUM).child(get("title").unwrap_or("Draft snippet".into())))
-                        .child(div().text_color(col(MUTED)).font_family(mono()).text_size(px(11. * z)).child(if closed { wh } else { "drafting…".to_string() })));
+                        .child(div().text_color(col(MUTED)).font_family(mono()).text_size(tpx(11. * z)).child(if closed { wh } else { "drafting…".to_string() })));
                 }
                 Block::Code { info, body, .. } => {
                     let (b1, b2) = (body.clone(), body.clone());
                     let lang = info.split_whitespace().next().unwrap_or("").to_string();
                     let lines: Vec<AnyElement> = body.split('\n').map(|l| div().whitespace_nowrap().child(if l.is_empty() { " ".to_string() } else { l.replace('\t', "    ") }).into_any_element()).collect();
                     let group: SharedString = format!("pre{owner}-{n}").into();
-                    let chip = |label: &'static str| div().px(px(6.)).rounded(px(4.)).bg(col(CARD)).border_1().border_color(col(BORDER)).text_size(px(10.5 * z)).cursor_pointer().hover(|s| s.bg(col(HOVER))).child(label);
-                    d = d.child(div().group(group.clone()).relative().bg(col(INPUT)).border_1().border_color(col(BORDER)).rounded(px(6. * z)).px(px(10. * z)).py(px(8. * z)).overflow_hidden().font_family(mono()).text_size(px(11.5 * z))
+                    let chip = |label: &'static str| div().px(px(6.)).rounded(px(4.)).bg(col(CARD)).border_1().border_color(col(BORDER)).text_size(tpx(10.5 * z)).cursor_pointer().hover(|s| s.bg(col(HOVER))).child(label);
+                    d = d.child(div().group(group.clone()).relative().bg(col(INPUT)).border_1().border_color(col(BORDER)).rounded(px(6. * z)).px(px(10. * z)).py(px(8. * z)).overflow_hidden().font_family(mono()).text_size(tpx(11.5 * z))
                         .children(lines)
                         .child(div().absolute().right(px(5.)).top(px(5.)).flex().gap(px(4.)).font_family(".SystemUIFont").opacity(0.).group_hover(group, |s| s.opacity(1.))
                             .when(is_snippet, |d| d.child(chip("→ Draft").on_mouse_down(MouseButton::Left, cx.listener(move |t, _: &MouseDownEvent, _, cx| {
@@ -263,7 +290,8 @@ impl CanvasView {
 
     /// A chat: the global panel (`fixed`, fills `h`) or a snippet's drawer (as tall as its content, up to `h`).
     pub(crate) fn chat_panel(&mut self, owner: u64, w: f32, h: f32, z: f32, fixed: bool, cx: &mut Context<Self>) -> Div {
-        let talk = self.doc.talk(owner).cloned().unwrap_or_default();
+        // the conversation is lifted out for the frame and put back below, never copied
+        let talk = self.doc.talk_mut(owner).map(std::mem::take).unwrap_or_default();
         let is_file = self.doc.card(owner).is_some_and(Card::is_file);
         let title = self.doc.card(owner).map(|c| basename(&c.title).to_string()).or(self.doc.region(owner).map(|r| r.title.clone())).unwrap_or_else(|| "Chat".into());
         let color = self.doc.region(owner).map(|r| r.color).or(self.doc.card(owner).filter(|c| !c.is_file()).map(|c| c.color)).unwrap_or(ACCENT);
@@ -272,7 +300,7 @@ impl CanvasView {
             .when(fixed, |d| d.flex_1()).when(!fixed, |d| d.flex_auto().min_h(px(40. * z)))
             .on_scroll_wheel(cx.listener(|_, e: &ScrollWheelEvent, _, cx| if !e.modifiers.control { cx.stop_propagation(); }));
         if talk.chat.is_empty() && !self.busy.contains_key(&owner) {
-            msgs = msgs.child(div().text_color(col(MUTED)).text_size(px(12. * z)).child(if owner == 0 { "General chat, not tied to any snippet. It sees the global context (top right of the canvas) and can read any project file on its own.\n\nAsk it to draft code and the snippets will appear on the canvas, ready to drag into files." } else if is_file { "Ask anything about this whole file. File sends just this file; Global also sends everything in the context list." } else { "Ask anything about this snippet. Snippet sends only this code; Global also sends everything in the context list. Suggested changes land in the ✎ Draft tab as a diff." }));
+            msgs = msgs.child(div().text_color(col(MUTED)).text_size(tpx(12. * z)).child(if owner == 0 { "General chat, not tied to any snippet. It sees the global context (top right of the canvas) and can read any project file on its own.\n\nAsk it to draft code and the snippets will appear on the canvas, ready to drag into files." } else if is_file { "Ask anything about this whole file. File sends just this file; Global also sends everything in the context list." } else { "Ask anything about this snippet. Snippet sends only this code; Global also sends everything in the context list. Suggested changes land in the ✎ Draft tab as a diff." }));
         }
         for m in &talk.chat { msgs = msgs.child(self.message_el(owner, m.role, m.title.clone(), &m.content, z, cx)); }
         let busy = self.busy.get(&owner).map(|b| (b.text.clone(), b.status.clone()));
@@ -281,30 +309,31 @@ impl CanvasView {
             self.fx.want_frame = true;
             let beat = ms_since(self.started) / 1000.;
             let dots = (0..3).map(|i| { let p = ((beat - i as f32 * 0.15).fract() * std::f32::consts::TAU).cos(); div().size(px(5. * z)).rounded_full().bg(cola(MUTED, 0.6 - 0.4 * p)) });
-            msgs = msgs.child(div().flex().items_center().gap(px(3. * z)).py(px(4. * z)).children(dots).when(!status.is_empty(), |d| d.child(div().ml(px(6. * z)).text_color(col(MUTED)).text_size(px(11. * z)).italic().child(status.clone()))));
+            msgs = msgs.child(div().flex().items_center().gap(px(3. * z)).py(px(4. * z)).children(dots).when(!status.is_empty(), |d| d.child(div().ml(px(6. * z)).text_color(col(MUTED)).text_size(tpx(11. * z)).italic().child(status.clone()))));
         }
         let focused = self.focus_input == Some(Input::Chat(owner));
         let input = self.input_el(Input::Chat(owner), if owner == 0 { "Ask about the project…" } else { "Ask…" }, 12.5 * z, cx);
         let running = busy.is_some();
         let global = talk.global;
+        if let Some(t) = self.doc.talk_mut(owner) { *t = talk; }
         let head = if owner == 0 {
             let n = self.doc.ctx.len();
             div().flex().items_center().gap(px(6.)).px(px(10.)).py(px(6.)).border_b_1().border_color(col(PANEL_BORDER))
-                .child(div().flex_1().font_weight(FontWeight::SEMIBOLD).child("Chat")).child(div().text_color(col(MUTED)).text_size(px(11.)).child(if n > 0 { format!("{n} item{} in context", if n == 1 { "" } else { "s" }) } else { "no context".into() }))
+                .child(div().flex_1().font_weight(FontWeight::SEMIBOLD).child("Chat")).child(div().text_color(col(MUTED)).text_size(tpx(11.)).child(if n > 0 { format!("{n} item{} in context", if n == 1 { "" } else { "s" }) } else { "no context".into() }))
                 .child(tool("reset", 13., MUTED, cx, move |t, _, _| t.reset_chat(owner)))
         } else {
             let seg = |label: &'static str, on: bool, to: bool, cx: &mut Context<Self>| div().px(px(8. * z)).py(px(2. * z)).cursor_pointer().text_color(col(if on { FG } else { MUTED })).when(on, |d| d.bg(cola(ACCENT, 0.22))).child(label)
                 .on_mouse_down(MouseButton::Left, cx.listener(move |t, _: &MouseDownEvent, _, cx| { cx.stop_propagation(); if let Some(x) = t.doc.talk_mut(owner) { x.global = to; } t.touch(); cx.notify(); }));
-            div().flex().items_center().gap(px(6. * z)).px(px(8. * z)).py(px(5. * z)).border_b_1().border_color(col(BORDER)).text_size(px(12. * z))
+            div().flex().items_center().gap(px(6. * z)).px(px(8. * z)).py(px(5. * z)).border_b_1().border_color(col(BORDER)).text_size(tpx(12. * z))
                 .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().font_weight(FontWeight::MEDIUM).child(title))
-                .child(div().flex().flex_none().border_1().border_color(col(BORDER)).rounded(px(6. * z)).overflow_hidden().text_size(px(11. * z)).child(seg(if is_file { "File" } else { "Snippet" }, !global, false, cx)).child(seg("Global", global, true, cx)))
+                .child(div().flex().flex_none().border_1().border_color(col(BORDER)).rounded(px(6. * z)).overflow_hidden().text_size(tpx(11. * z)).child(seg(if is_file { "File" } else { "Snippet" }, !global, false, cx)).child(seg("Global", global, true, cx)))
                 .child(tool("reset", 13. * z, MUTED, cx, move |t, _, _| t.reset_chat(owner)))
                 .child(tool("close", 13. * z, MUTED, cx, move |t, _, _| t.toggle_chat(owner)))
         };
         let side = if owner == 0 { PANEL_BORDER } else { BORDER };
         let shell = if fixed { div().w(px(w)).h(px(h)).bg(col(PANEL)).border_l_1().border_color(col(PANEL_BORDER)) }
             else { div().relative().w(px(w)).max_h(px(h)).pl(px(3. * z)).bg(col(CARD)).border_1().border_l_0().border_color(col(BORDER)).rounded_r(px(9. * z)).child(div().absolute().left_0().top_0().bottom_0().w(px(3. * z)).bg(col(color))) };
-        shell.flex().flex_col().text_size(px(12.5 * z)).text_color(col(FG))
+        shell.flex().flex_col().text_size(tpx(12.5 * z)).text_color(col(FG))
             .on_any_mouse_down(cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()))
             .child(head).child(msgs)
             .child(div().flex().flex_none().gap(px(6. * z)).p(px(7. * z)).items_end().border_t_1().border_color(col(side))
@@ -325,7 +354,7 @@ impl CanvasView {
         let color = self.doc.region(owner).map(|r| r.color).or(self.doc.card(owner).map(|c| c.color)).unwrap_or(ACCENT);
         let editing = self.focus_input == Some(Input::DraftEdit(owner)) || self.inputs.contains_key(&Input::DraftEdit(owner));
         let h_handle = self.scroll_handle(owner.wrapping_add(1 << 40));
-        let mut body = div().id(("draft", owner)).max_h(px(360. * z)).min_h(px(40. * z)).overflow_y_scroll().track_scroll(&h_handle).font_family(mono()).text_size(px(12. * z)).line_height(px(LH * z))
+        let mut body = div().id(("draft", owner)).max_h(px(360. * z)).min_h(px(40. * z)).overflow_y_scroll().track_scroll(&h_handle).font_family(mono()).text_size(tpx(12. * z)).line_height(px(LH * z))
             .on_scroll_wheel(cx.listener(|_, e: &ScrollWheelEvent, _, cx| if !e.modifiers.control { cx.stop_propagation(); }));
         if editing {
             body = body.bg(col(INPUT)).child(div().px(px(10. * z)).py(px(6. * z)).child(self.input_el(Input::DraftEdit(owner), "", 12. * z, cx)));
@@ -347,13 +376,13 @@ impl CanvasView {
         }
         let focused = self.focus_input == Some(Input::Ask(id));
         let ask = self.input_el(Input::Ask(id), "Ask the LLM for a change… (Enter)", 12. * z, cx);
-        let dbtn = |label: &'static str, primary: bool| div().px(px(9. * z)).py(px(2. * z)).rounded(px(5. * z)).border_1().border_color(col(if primary { BTN } else { BORDER })).when(primary, |d| d.bg(col(BTN)).text_color(col(0xffffff))).text_size(px(11.5 * z)).cursor_pointer().hover(|s| s.bg(col(if primary { ACCENT } else { HOVER }))).child(label);
-        div().relative().w(px(w)).pl(px(3. * z)).flex().flex_col().bg(col(CARD)).border_1().border_l_0().border_color(col(BORDER)).rounded_r(px(9. * z)).text_size(px(12. * z)).text_color(col(FG))
+        let dbtn = |label: &'static str, primary: bool| div().px(px(9. * z)).py(px(2. * z)).rounded(px(5. * z)).border_1().border_color(col(if primary { BTN } else { BORDER })).when(primary, |d| d.bg(col(BTN)).text_color(col(0xffffff))).text_size(tpx(11.5 * z)).cursor_pointer().hover(|s| s.bg(col(if primary { ACCENT } else { HOVER }))).child(label);
+        div().relative().w(px(w)).pl(px(3. * z)).flex().flex_col().bg(col(CARD)).border_1().border_l_0().border_color(col(BORDER)).rounded_r(px(9. * z)).text_size(tpx(12. * z)).text_color(col(FG))
             .child(div().absolute().left_0().top_0().bottom_0().w(px(3. * z)).bg(col(color)))
             .on_any_mouse_down(cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()))
             .child(div().flex().items_center().gap(px(6. * z)).px(px(8. * z)).py(px(5. * z)).border_b_1().border_color(col(BORDER))
                 .child(div().font_weight(FontWeight::MEDIUM).child("✎ Draft"))
-                .child(div().flex_1().font_family(mono()).text_size(px(11. * z)).flex().gap(px(4.)).when(add + del == 0, |d| d.font_family(".SystemUIFont").text_color(col(MUTED)).child("no changes")).when(add + del > 0, |d| d.font_weight(FontWeight::SEMIBOLD).child(div().text_color(col(OK)).child(format!("+{add}"))).child(div().text_color(col(BAD)).child(format!("−{del}")))))
+                .child(div().flex_1().font_family(mono()).text_size(tpx(11. * z)).flex().gap(px(4.)).when(add + del == 0, |d| d.font_family(".SystemUIFont").text_color(col(MUTED)).child("no changes")).when(add + del > 0, |d| d.font_weight(FontWeight::SEMIBOLD).child(div().text_color(col(OK)).child(format!("+{add}"))).child(div().text_color(col(BAD)).child(format!("−{del}")))))
                 .child(dbtn(if editing { "Done" } else { "Edit" }, false).on_mouse_down(MouseButton::Left, cx.listener(move |t, _: &MouseDownEvent, _, cx| { cx.stop_propagation(); if t.inputs.contains_key(&Input::DraftEdit(owner)) { t.focus_input = Some(Input::DraftEdit(owner)); t.commit_draft_edit(); } else { t.begin_draft_edit(id); } cx.notify(); })))
                 .child(tool("reset", 13. * z, MUTED, cx, move |t, _, _| t.reset_draft(id)))
                 .child(dbtn("Apply", true).on_mouse_down(MouseButton::Left, cx.listener(move |t, _: &MouseDownEvent, _, cx| { cx.stop_propagation(); t.apply_draft(id); cx.notify(); })))
@@ -372,19 +401,19 @@ impl CanvasView {
         let n = self.doc.ctx.len();
         let lines: usize = self.doc.ctx.iter().map(|i| self.doc.ctx_lines(*i)).sum();
         let open = self.hist_open;
-        let mut d = div().absolute().right(px(right)).top(px(TOP + 10.)).w(px(290.)).bg(cola(PANEL, 0.94)).border_1().border_color(col(PANEL_BORDER)).rounded(px(9.)).shadow(vec![shadow(8., 26., 0.4)]).text_size(px(12.))
+        let mut d = div().absolute().right(px(right)).top(px(TOP + 10.)).w(px(290.)).bg(cola(PANEL, 0.94)).border_1().border_color(col(PANEL_BORDER)).rounded(px(9.)).shadow(vec![shadow(8., 26., 0.4)]).text_size(tpx(12.))
             .on_any_mouse_down(cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()))
             .on_scroll_wheel(cx.listener(|_, _: &ScrollWheelEvent, _, cx| cx.stop_propagation()))
             .child(div().flex().items_center().gap(px(6.)).px(px(10.)).py(px(7.)).cursor_pointer().child(div().flex_1().font_weight(FontWeight::SEMIBOLD).child("Context"))
                 .child(div().text_color(col(MUTED)).child(if n > 0 { format!("{n} item{} · {lines} line{}", if n == 1 { "" } else { "s" }, if lines == 1 { "" } else { "s" }) } else { "empty".into() }))
-                .child(div().text_color(col(MUTED)).text_size(px(10.)).child(if open { "▴" } else { "▾" }))
+                .child(div().text_color(col(MUTED)).text_size(tpx(10.)).child(if open { "▴" } else { "▾" }))
                 .on_mouse_down(MouseButton::Left, cx.listener(|t, _: &MouseDownEvent, _, cx| { t.hist_open = !t.hist_open; cx.notify(); })));
         if open {
             let mut chips = div().flex().flex_wrap().gap(px(4.)).px(px(9.)).pb(px(7.));
             if n == 0 { chips = chips.child(div().px(px(1.)).text_color(col(MUTED)).child("Use ◎ on a file or snippet to add it.")); }
             for id in self.doc.ctx.clone() {
                 let label: String = self.doc.ctx_label(id).chars().take(26).collect();
-                chips = chips.child(div().flex().items_center().gap(px(2.)).pl(px(7.)).pr(px(2.)).bg(col(HOVER)).rounded(px(10.)).text_size(px(11.)).cursor_pointer().child(label).child(tool("close", 9., MUTED, cx, move |t, _, _| t.toggle_ctx(id)))
+                chips = chips.child(div().flex().items_center().gap(px(2.)).pl(px(7.)).pr(px(2.)).bg(col(HOVER)).rounded(px(10.)).text_size(tpx(11.)).cursor_pointer().child(label).child(tool("close", 9., MUTED, cx, move |t, _, _| t.toggle_ctx(id)))
                     .on_mouse_down(MouseButton::Left, cx.listener(move |t, _: &MouseDownEvent, _, cx| { t.focus_card(id); cx.notify(); })));
             }
             let mut log = div().id("hist").max_h(px(170.)).overflow_y_scroll().border_t_1().border_color(col(PANEL_BORDER)).py(px(4.));
@@ -395,7 +424,7 @@ impl CanvasView {
                     .child(div().w(px(12.)).flex_none().flex().justify_center().font_weight(FontWeight::BOLD).text_color(col(if ev.added { OK } else { BAD })).child(if ev.added { "+" } else { "−" }))
                     .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().child(ev.text))
                     .child(div().flex_none().text_color(col(MUTED)).child(format!("{} ln", ev.lines)))
-                    .child(div().flex_none().text_color(col(MUTED)).text_size(px(10.5)).child(format!("{:02}:{:02}", sec / 3600, sec / 60 % 60)))
+                    .child(div().flex_none().text_color(col(MUTED)).text_size(tpx(10.5)).child(format!("{:02}:{:02}", sec / 3600, sec / 60 % 60)))
                     .on_mouse_down(MouseButton::Left, cx.listener(move |t, _: &MouseDownEvent, _, cx| { t.focus_card(r); cx.notify(); })));
             }
             d = d.child(chips).child(log);
@@ -546,7 +575,7 @@ impl CanvasView {
                 Some((f, i)) => (format!("Explaining {}  ({}/{})", self.explaining.keys().next().cloned().unwrap_or_default(), (*i).min(f.len()), f.len()), i.saturating_sub(1) as f32 / f.len().max(1) as f32),
                 None => (format!("Explaining {}…", self.explaining.keys().cloned().collect::<Vec<_>>().join(", ")), 0.5),
             };
-            out.push(div().absolute().top(px(TOP + 10.)).left(px(ax + aw / 2. - 200.)).w(px(400.)).flex().items_center().gap(px(10.)).pl(px(12.)).pr(px(10.)).pt(px(7.)).pb(px(9.)).bg(col(PANEL)).border_1().border_color(col(PANEL_BORDER)).rounded(px(9.)).shadow(vec![shadow(8., 26., 0.4)]).text_size(px(12.))
+            out.push(div().absolute().top(px(TOP + 10.)).left(px(ax + aw / 2. - 200.)).w(px(400.)).flex().items_center().gap(px(10.)).pl(px(12.)).pr(px(10.)).pt(px(7.)).pb(px(9.)).bg(col(PANEL)).border_1().border_color(col(PANEL_BORDER)).rounded(px(9.)).shadow(vec![shadow(8., 26., 0.4)]).text_size(tpx(12.))
                 .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().child(label)).child(tb(None, "Stop", false, cx, |t, _, _| t.stop_explain()))
                 .child(div().absolute().left(px(10.)).right(px(10.)).bottom(px(4.)).h(px(2.)).rounded(px(2.)).bg(col(HOVER)).overflow_hidden().child(div().h_full().w(relative(frac.clamp(0.02, 1.))).bg(col(SNIP))))
                 .into_any_element());
@@ -554,21 +583,21 @@ impl CanvasView {
         let empty = self.doc.cards.is_empty();
         if empty {
             out.push(div().absolute().left(px(ax)).top(px(ay + ah / 2. - 60.)).w(px(aw)).flex().flex_col().items_center().gap(px(5.)).text_color(col(MUTED))
-                .child(div().mb(px(4.)).text_size(px(19.)).font_weight(FontWeight::MEDIUM).text_color(col(FG)).child("Your canvas is empty")).child("Click a file in the explorer (or drag it here) to place it.").child("Select lines → ◆ Snippet · drag a snippet onto a file to merge it").child("Double-click empty space for a new snippet · try Explain All").into_any_element());
+                .child(div().mb(px(4.)).text_size(tpx(19.)).font_weight(FontWeight::MEDIUM).text_color(col(FG)).child("Your canvas is empty")).child("Click a file in the explorer (or drag it here) to place it.").child("Select lines → ◆ Snippet · drag a snippet onto a file to merge it").child("Double-click empty space for a new snippet · try Explain All").into_any_element());
         }
         if self.show_help || empty {
-            let kbd = |k: &'static str| div().px(px(4.)).rounded(px(4.)).bg(col(PANEL)).border_1().border_b_2().border_color(col(PANEL_BORDER)).text_size(px(10.5)).child(k).into_any_element();
+            let kbd = |k: &'static str| div().px(px(4.)).rounded(px(4.)).bg(col(PANEL)).border_1().border_b_2().border_color(col(PANEL_BORDER)).text_size(tpx(10.5)).child(k).into_any_element();
             let t = |s: &'static str| div().child(s).into_any_element();
             let parts = vec![kbd("Wheel"), t("scroll ·"), kbd("Shift"), t("+wheel sideways ·"), kbd("Ctrl"), t("+wheel zoom · middle-drag pan ·"), kbd("Space"), t("+drag moves any card ·"), kbd("Ctrl"), t("/"), kbd("Shift"), t("+click multi-select · right-click → Merge · double-click to edit ·"),
                 kbd("Shift"), t("+drag moves selected lines, or grabs a snippet ·"), kbd("Alt"), t("+drag a snippet for a reference ·"), kbd("Esc"), t("cancels a drag")];
-            out.push(div().absolute().left(px(ax + 12.)).bottom(px(10.)).max_w(px((aw - 24.).max(100.))).flex().flex_wrap().items_center().gap(px(4.)).px(px(8.)).py(px(4.)).bg(cola(PANEL, 0.85)).rounded(px(6.)).text_size(px(11.5)).text_color(col(MUTED)).children(parts).into_any_element());
+            out.push(div().absolute().left(px(ax + 12.)).bottom(px(10.)).max_w(px((aw - 24.).max(100.))).flex().flex_wrap().items_center().gap(px(4.)).px(px(8.)).py(px(4.)).bg(cola(PANEL, 0.85)).rounded(px(6.)).text_size(tpx(11.5)).text_color(col(MUTED)).children(parts).into_any_element());
         }
         if let Some(models) = self.models.clone() {
             let cur = self.settings.model.clone();
-            let label = |s: String| div().px(px(9.)).py(px(4.)).text_size(px(10.5)).text_color(col(MUTED)).child(s.to_uppercase());
+            let label = |s: String| div().px(px(9.)).py(px(4.)).text_size(tpx(10.5)).text_color(col(MUTED)).child(s.to_uppercase());
             let sep = || div().h(px(1.)).mx(px(2.)).my(px(5.)).bg(col(PANEL_BORDER));
             let item = |name: String, on: bool| div().px(px(9.)).py(px(5.)).rounded(px(5.)).cursor_pointer().whitespace_nowrap().overflow_hidden().hover(|s| s.bg(col(HOVER))).when(on, |d| d.text_color(col(ACCENT))).child(name);
-            let mut d = div().absolute().top(px(TOP + 4.)).right(px(right + 100.)).w(px(280.)).p(px(5.)).flex().flex_col().bg(col(CARD)).border_1().border_color(col(BORDER)).rounded(px(8.)).shadow(vec![shadow(12., 40., 0.53)]).text_size(px(12.5)).on_any_mouse_down(cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()));
+            let mut d = div().absolute().top(px(TOP + 4.)).right(px(right + 100.)).w(px(280.)).p(px(5.)).flex().flex_col().bg(col(CARD)).border_1().border_color(col(BORDER)).rounded(px(8.)).shadow(vec![shadow(12., 40., 0.53)]).text_size(tpx(12.5)).on_any_mouse_down(cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()));
             d = d.child(label(format!("{} models", self.settings.provider)));
             if models.is_empty() { d = d.child(div().px(px(9.)).py(px(5.)).text_color(col(MUTED)).child("None listed. Is the server running?")); }
             for m in models { let n = m.clone(); d = d.child(item(m.clone(), m == cur).on_mouse_down(MouseButton::Left, cx.listener(move |t, _: &MouseDownEvent, _, cx| { cx.stop_propagation(); t.settings.model = n.clone(); let _ = t.settings.save(); t.models = None; cx.notify(); }))); }
@@ -584,12 +613,12 @@ impl CanvasView {
             for (i, label) in SETTING_FIELDS.iter().enumerate() {
                 let focused = self.focus_input == Some(Input::Setting(i));
                 let input = self.input_el(Input::Setting(i), "", 13., cx);
-                form = form.child(div().child(div().text_size(px(11.5)).text_color(col(MUTED)).child(*label)).child(div().mt(px(3.)).px(px(8.)).py(px(5.)).bg(col(INPUT)).border_1().border_color(col(if focused { ACCENT } else { BORDER })).rounded(px(5.)).overflow_hidden().child(input)));
+                form = form.child(div().child(div().text_size(tpx(11.5)).text_color(col(MUTED)).child(*label)).child(div().mt(px(3.)).px(px(8.)).py(px(5.)).bg(col(INPUT)).border_1().border_color(col(if focused { ACCENT } else { BORDER })).rounded(px(5.)).overflow_hidden().child(input)));
             }
             let (w, h) = self.win_size;
             out.push(div().absolute().left_0().top_0().size_full().bg(cola(0, 0.45)).on_any_mouse_down(cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()))
                 .child(div().absolute().left(px(w / 2. - 280.)).top(px((h / 2. - 370.).max(10.))).w(px(560.)).p(px(16.)).flex().flex_col().gap(px(12.)).bg(col(CARD)).border_1().border_color(col(BORDER)).rounded(px(10.)).shadow(vec![shadow(18., 60., 0.6)])
-                    .child(div().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).child("Settings")).child(form)
+                    .child(div().text_size(tpx(15.)).font_weight(FontWeight::SEMIBOLD).child("Settings")).child(form)
                     .child(div().flex().justify_end().gap(px(6.)).child(tb(None, "Close", false, cx, |t, _, _| { t.show_settings = false; t.focus_input = None; })).child(tb(None, "Save", true, cx, |t, _, _| t.save_settings()))))
                 .into_any_element());
         }
@@ -602,13 +631,13 @@ impl CanvasView {
             let p = ease_out(ms_since(m.at) / 120.);
             if p < 1. { self.fx.want_frame = true; }
             let (x, y) = (m.x.min(self.win_size.0 - 270.), m.y.min(self.win_size.1 - m.items.len() as f32 * 29. - 16.).max(0.) + 4. * (1. - p));
-            let mut d = div().absolute().left(px(x)).top(px(y)).w(px(260.)).p(px(4.)).flex().flex_col().bg(col(CARD)).border_1().border_color(col(BORDER)).rounded(px(8.)).shadow(vec![shadow(12., 40., 0.6)]).text_size(px(13.)).opacity(p)
+            let mut d = div().absolute().left(px(x)).top(px(y)).w(px(260.)).p(px(4.)).flex().flex_col().bg(col(CARD)).border_1().border_color(col(BORDER)).rounded(px(8.)).shadow(vec![shadow(12., 40., 0.6)]).text_size(tpx(13.)).opacity(p)
                 .on_any_mouse_down(cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()));
             for (i, it) in m.items.iter().enumerate() {
                 match &it.act {
                     None => {
                         if i > 0 { d = d.child(div().h(px(1.)).mx(px(2.)).my(px(4.)).bg(col(BORDER))); }
-                        d = d.child(div().px(px(10.)).pt(px(4.)).pb(px(2.)).text_size(px(10.5)).text_color(col(MUTED)).overflow_hidden().whitespace_nowrap().child(it.label.to_uppercase()));
+                        d = d.child(div().px(px(10.)).pt(px(4.)).pb(px(2.)).text_size(tpx(10.5)).text_color(col(MUTED)).overflow_hidden().whitespace_nowrap().child(it.label.to_uppercase()));
                     }
                     Some(a) => { let a = a.clone(); d = d.child(div().px(px(10.)).py(px(5.)).rounded(px(5.)).cursor_pointer().hover(|s| s.bg(col(BTN)).text_color(col(0xffffff))).whitespace_nowrap().overflow_hidden().child(it.label.clone())
                         .on_mouse_down(MouseButton::Left, cx.listener(move |t, _: &MouseDownEvent, w, cx| { cx.stop_propagation(); t.menu = None; a(t, w, cx); cx.notify(); }))); }
@@ -622,7 +651,7 @@ impl CanvasView {
                 let age = ms_since(*at);
                 let p = ease_out(age / 200.) * (1. - ((age - 4700.) / 300.).clamp(0., 1.));
                 if age < 200. || age > 4700. { self.fx.want_frame = true; }
-                t = t.child(div().relative().max_w(px(420.)).pl(px(15.)).pr(px(12.)).py(px(8.)).mt(px(4. * (1. - ease_out(age / 200.)))).bg(col(CARD)).border_1().border_color(col(BORDER)).rounded(px(7.)).shadow(vec![shadow(8., 26., 0.47)]).text_size(px(12.5)).opacity(p).overflow_hidden()
+                t = t.child(div().relative().max_w(px(420.)).pl(px(15.)).pr(px(12.)).py(px(8.)).mt(px(4. * (1. - ease_out(age / 200.)))).bg(col(CARD)).border_1().border_color(col(BORDER)).rounded(px(7.)).shadow(vec![shadow(8., 26., 0.47)]).text_size(tpx(12.5)).opacity(p).overflow_hidden()
                     .child(div().absolute().left_0().top_0().bottom_0().w(px(3.)).bg(col(if *err { BAD } else { ACCENT }))).child(m.clone()));
             }
             out.push(t.into_any_element());

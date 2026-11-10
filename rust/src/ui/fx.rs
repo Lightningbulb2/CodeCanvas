@@ -119,6 +119,10 @@ impl Fx {
         t.value()
     }
     pub fn forget(&mut self, key: Tw) { self.tweens.remove(&key); }
+    /// Keeps only the tweens of cards and snippets that still exist.
+    pub fn forget_except(&mut self, alive: &std::collections::HashSet<u64>) {
+        self.tweens.retain(|k, _| match k { Tw::Drawer(id) | Tw::Draft(id) => alive.contains(id), _ => true });
+    }
 
     /// Pixels that line `i` of `file` is displaced by running effects.
     pub fn shift(&self, file: u64, i: usize) -> f32 {
