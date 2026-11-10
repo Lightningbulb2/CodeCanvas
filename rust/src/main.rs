@@ -69,7 +69,14 @@ fn main() {
 
     Application::new().with_assets(ui::fx::Icons).run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1500.), px(950.)), cx);
-        let opts = WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() };
+        // The app id ties the window to codecanvas.desktop, which is where the taskbar gets its name and icon.
+        let title = format!("CodeCanvas — {}", root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+        let opts = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            app_id: Some("codecanvas".into()),
+            titlebar: Some(gpui::TitlebarOptions { title: Some(title.into()), ..Default::default() }),
+            ..Default::default()
+        };
         cx.open_window(opts, |window, cx| cx.new(|cx| ui::CanvasView::new(root, file, rx, window, cx))).unwrap();
         cx.on_window_closed(|cx| { if cx.windows().is_empty() { cx.quit(); } }).detach();
         cx.activate(true);
