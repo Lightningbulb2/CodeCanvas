@@ -432,3 +432,26 @@ body.space-held .pane { cursor: grab; }
 /* ---------- performance ---------- */
 /* a card's insides never affect anything outside it, so reflowing one (live drags, edits) stays local */
 .card { contain: layout style; }
+
+/* ---------- find and replace ---------- */
+.find-bar { position: absolute; right: 14px; width: min(430px, calc(100% - 28px)); min-width: 210px; display: flex; align-items: flex-start; gap: 3px; padding: 4px; background: #252830; border: 1px solid var(--card-border); border-top: 0; border-radius: 0 0 5px 5px; box-shadow: 0 4px 14px #0008; color: var(--muted); font-family: var(--ui); font-size: 11.5px; z-index: 8; cursor: default; user-select: none; }
+.find-bar .fb-rows { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.find-bar .fb-row { display: flex; align-items: center; gap: 3px; }
+.find-bar .fb-rep { display: none; }
+.find-bar.with-replace .fb-rep { display: flex; }
+.find-bar .fb-box { flex: 1; min-width: 0; display: flex; align-items: center; gap: 2px; height: 24px; padding: 0 2px 0 6px; background: var(--input-bg); border: 1px solid var(--card-border); border-radius: 3px; }
+.find-bar .fb-box:focus-within { border-color: var(--accent); }
+.find-bar .fb-box.bad { border-color: var(--bad); }
+.find-bar .fb-in { flex: 1; min-width: 0; border: 0; outline: none; background: transparent; color: var(--input-fg); font-family: var(--mono); font-size: 12px; padding: 0; }
+.find-bar button { border: 1px solid transparent; background: transparent; color: inherit; border-radius: 3px; cursor: pointer; padding: 0 4px; height: 18px; font-size: 10.5px; white-space: nowrap; flex: none; }
+.find-bar button:hover { background: var(--hover); color: var(--fg); }
+.find-bar .fb-tog { font-family: var(--mono); }
+.find-bar .fb-tog.on { border-color: var(--accent); background: var(--accent-soft); color: var(--fg); }
+.find-bar .fb-act { height: 20px; font-size: 11.5px; padding: 0 5px; }
+.find-bar .fb-more { width: 16px; height: 24px; padding: 0; font-size: 10px; }
+.find-bar .fb-count { flex: none; min-width: 58px; max-width: 150px; padding: 0 3px; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.find-bar .fb-count.bad { color: var(--bad); }
+.find-layer { position: absolute; left: 0; top: 0; width: 100%; height: 0; pointer-events: none; font-family: var(--mono); font-size: 12.5px; }
+.find-layer i { position: absolute; height: var(--lh); border-radius: 2px; background: #ea5c0055; }
+.find-layer i.cur { background: #515c6a; outline: 1px solid var(--warn); outline-offset: -1px; }
+.card.live .find-layer, .world.far .find-bar, .world.far .find-layer, .card.editing .find-layer { display: none; }

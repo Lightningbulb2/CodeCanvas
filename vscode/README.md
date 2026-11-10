@@ -50,6 +50,21 @@ Use the split buttons in the top bar, a view's hover bar (top-left), right-click
 - **File chats:** files have their own **Chat** tab in the top-right corner (or the chat icon in the header), with *File* / *Global* context.
 - **Resetting a chat:** every chat has a ↺ button that resets it.
 
+## Find and replace
+
+**Ctrl+F** (or the magnifier in a card's header) opens a find bar at the top of that file or snippet; **Ctrl+H** opens it with Replace. It searches the card being edited, else the selected card, else the one under the pointer. With a snippet inside a file selected, it searches the file limited to that snippet's lines.
+
+| | |
+|---|---|
+| Next / previous match | Enter / Shift+Enter (also F3 / Shift+F3) |
+| Match case, whole word, regular expression | `Aa` `ab` `.*` (Alt+C, Alt+W, Alt+R) |
+| Find in selection | `≡` (Alt+L), limits the search to the selected lines |
+| Replace / replace all | Enter in the Replace box / Ctrl+Alt+Enter |
+| Preserve case | `AB` (Alt+P) |
+| Close | Esc |
+
+In regular-expression mode the replacement can use `$1`, `$2`, … for groups. Matches are found within a line; a pattern can't span lines. Replacing in a reference card changes its source file, and every replace is one undo step.
+
 ## Moving things
 
 - **Esc:** cancels any drag in progress and puts everything back.

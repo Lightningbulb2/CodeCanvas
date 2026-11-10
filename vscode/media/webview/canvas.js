@@ -666,6 +666,7 @@ function renderFile(f) {
   const dir = dirname(f.path), base = basename(f.path);
   const tools = h('div', { class: 'tools' },
     iconBtn('explain', 'Explain this file (LLM breaks it into explained snippets)', () => explainFile(f.path)),
+    iconBtn('search', 'Find and replace in this file (Ctrl+F)', () => toggleFind(f)),
     iconBtn('notes', 'Toggle all snippet chats/notes', () => toggleAllDrawers(f)),
     iconBtn('chat', 'Chat about this whole file', () => toggleDrawer(f)),
     iconBtn('ctx', 'Add / remove file from global context', () => toggleCtx(f.id), 'ctx-btn'),
@@ -697,6 +698,7 @@ function renderFile(f) {
   positionCard(f);
   refreshRefs(f);
   sizeFarLabel(f);
+  mountFind(f);
 }
 
 /** A card drawn while its view is zoomed far out gets its label sized straight away (see applyView). */
@@ -934,6 +936,7 @@ function renderSnippetCard(s) {
   if (src) tools.append(iconBtn('editor', 'Jump to the source lines', () => focusCard(src.id)));
   if (s.target?.file) tools.append(iconBtn('merge', 'Apply to its suggested location', () => applyToTarget(s)));
   tools.append(
+    iconBtn('search', 'Find and replace in this snippet (Ctrl+F)', () => toggleFind(s)),
     iconBtn('ctx', 'Add / remove from global context', () => toggleCtx(s.id), 'ctx-btn'),
     iconBtn('chat', 'Toggle chat', () => toggleDrawer(s)),
     src ? iconBtn('close', 'Remove this reference (the source lines stay)', () => { pushUndo(); removeSnippet(s); })
@@ -974,6 +977,7 @@ function renderSnippetCard(s) {
   if (s.drawerOpen) requestAnimationFrame(() => layoutDraftTab(s));
   positionCard(s);
   sizeFarLabel(s);
+  mountFind(s);
 }
 
 function renameInline(s, titleEl) {
@@ -2093,6 +2097,14 @@ function enterEdit(c, line = 0) {
   ta.addEventListener('keydown', e => {
     e.stopPropagation();
     if (e.key === 'Escape') { e.preventDefault(); exitEdit(); }
+    else if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key.toLowerCase() === 'f' || e.key.toLowerCase() === 'h')) {
+      // find works on the card's committed text, so the edit is finished first; a one-line selection seeds the query
+      e.preventDefault();
+      const seed = ta.value.slice(ta.selectionStart, ta.selectionEnd);
+      const card = c;
+      exitEdit();
+      openFind(card, e.key.toLowerCase() === 'h', seed && !seed.includes('\n') ? seed : '');
+    }
     else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') { e.preventDefault(); const f = c; exitEdit(); if (f.type === 'file') saveFile(f); }
     else if (e.key === 'Tab') {
       e.preventDefault();
@@ -2634,6 +2646,283 @@ function onContextMenu(e, P) {
 }
 
 // =====================================================================
+// find and replace inside one card (modelled on VS Code's find widget)
+// =====================================================================
+const finds = new Map(); // card id -> find state; kept by id so it survives re-renders and undo
+const MAX_HITS = 20000;
+
+const findLines = c => c.lines || [];
+/** Column a character index is drawn at (tab stops every 4, as the cards' `tab-size`). */
+function visualCol(line, index) {
+  let col = 0;
+  for (let i = 0; i < index; i++) col += line[i] === '\t' ? 4 - (col % 4) : 1;
+  return col;
+}
+
+function findRegex(st, sticky) {
+  if (!st.q) return null;
+  let src = st.regex ? st.q : st.q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (st.word) src = `\\b(?:${src})\\b`;
+  return new RegExp(src, (sticky ? 'y' : 'g') + (st.case ? '' : 'i') + 'u');
+}
+
+function computeHits(c, st) {
+  st.hits = []; st.error = '';
+  let re;
+  try { re = findRegex(st, false); } catch (err) { st.error = String(err.message || err).replace(/^Invalid regular expression: /, ''); return; }
+  if (!re) return;
+  const lines = findLines(c);
+  const [a, b] = st.within || [0, lines.length - 1];
+  scan: for (let i = Math.max(0, a); i <= Math.min(b, lines.length - 1); i++) {
+    for (const m of lines[i].matchAll(re)) {
+      if (!m[0]) continue;
+      st.hits.push({ line: i, start: m.index, end: m.index + m[0].length });
+      if (st.hits.length >= MAX_HITS) break scan;
+    }
+  }
+  st.cur = Math.min(st.cur, Math.max(0, st.hits.length - 1));
+}
+
+/** VS Code's "preserve case": shape the replacement like the text it replaces. */
+function likeCase(found, rep) {
+  const letters = found.replace(/[^\p{L}]/gu, '');
+  if (!letters) return rep;
+  if (letters === letters.toUpperCase() && letters !== letters.toLowerCase()) return rep.toUpperCase();
+  if (letters === letters.toLowerCase()) return rep.toLowerCase();
+  if (letters[0] === letters[0].toUpperCase()) return rep.charAt(0).toUpperCase() + rep.slice(1);
+  return rep;
+}
+
+/** What a match is replaced with: `$1`, `$&` and `$$` in regex mode, optionally shaped like the match. */
+function replacementFor(st, line, hit) {
+  let out = st.rep;
+  if (st.regex) {
+    const re = findRegex(st, true);
+    re.lastIndex = hit.start;
+    const m = re.exec(line);
+    if (m) out = st.rep.replace(/\$(\$|&|\d{1,2})/g, (all, k) => (k === '$' ? '$' : k === '&' ? m[0] : m[+k] ?? (+k < m.length ? '' : all)));
+  }
+  return st.keep ? likeCase(line.slice(hit.start, hit.end), out) : out;
+}
+
+/** Write new text for some lines of a card as one undo step. A reference card writes to its source file. */
+function setCardLines(c, changed) {
+  if (!changed.length) return;
+  pushUndo();
+  const src = c.type === 'file' ? null : refSource(c);
+  const f = c.type === 'file' ? c : src ? S.files.get(src.fileId) : null;
+  if (f) {
+    const base = src ? src.start : 0;
+    for (const [line, text] of changed) spliceFile(f, base + line, 1, [text]); // line by line, so snippets stay attached
+    renderFile(f);
+  } else {
+    for (const [line, text] of changed) c.lines[line] = text;
+    renderSnippetCard(c);
+  }
+  renderLinks();
+  hooks.onDirty?.();
+  scheduleSave();
+}
+
+function findStep(c, dir) {
+  const st = finds.get(c.id);
+  if (!st || !st.hits.length) return;
+  st.cur = (st.cur + dir + st.hits.length) % st.hits.length;
+  paintFind(c);
+  revealHit(c);
+}
+
+/** Pan the view so the current match is on screen. */
+function revealHit(c) {
+  const st = finds.get(c.id), hit = st?.hits[st.cur];
+  if (!hit) return;
+  const P = paneOf(c), t = P.target;
+  const top = c.el.offsetTop + (c.bodyEl?.offsetTop || HEAD) + PAD + hit.line * LH;
+  const y = top * t.z + t.y, x = c.x * t.z + t.x;
+  if (y < 90 || y > P.el.clientHeight - 60) { t.y = P.el.clientHeight * 0.4 - top * t.z; P.anchor = { x: 0, y: 0 }; }
+  if (x < -200 || x > P.el.clientWidth - 200) { t.x = 80 - c.x * t.z; P.anchor = { x: 0, y: 0 }; }
+}
+
+function replaceOne(c) {
+  const st = finds.get(c.id), hit = st?.hits[st.cur];
+  if (!hit) return;
+  const line = findLines(c)[hit.line];
+  const out = replacementFor(st, line, hit);
+  const after = hit.start + out.length;
+  st.wantFocus = 'rep';
+  setCardLines(c, [[hit.line, line.slice(0, hit.start) + out + line.slice(hit.end)]]);
+  // go on to the next match after what was just written, even if the new text matches too
+  const next = st.hits.findIndex(h => h.line > hit.line || (h.line === hit.line && h.start >= after));
+  st.cur = next < 0 ? 0 : next;
+  paintFind(c);
+  revealHit(c);
+}
+
+function replaceAll(c) {
+  const st = finds.get(c.id);
+  if (!st || !st.hits.length) return;
+  const lines = findLines(c), changed = new Map();
+  for (let i = st.hits.length - 1; i >= 0; i--) { // right to left, so earlier matches on a line keep their offsets
+    const h = st.hits[i];
+    const cur = changed.get(h.line) ?? lines[h.line];
+    changed.set(h.line, cur.slice(0, h.start) + replacementFor(st, lines[h.line], h) + cur.slice(h.end));
+  }
+  const n = st.hits.length;
+  st.wantFocus = 'rep';
+  setCardLines(c, [...changed]);
+  toast(`Replaced ${plural(n, 'occurrence')}`, 'ok', 2500);
+}
+
+function toggleWithin(c) {
+  const st = finds.get(c.id);
+  if (st.within) st.within = null;
+  else {
+    const r = c.type === 'file' ? selRange(c) : null;
+    if (!r) { toast('Select some lines first, then turn on Find in Selection.'); return; }
+    st.within = [r.a, r.b];
+  }
+  refreshFind(c);
+}
+
+function closeFind(c) {
+  const st = finds.get(c.id);
+  finds.delete(c.id);
+  st?.el.remove(); st?.layer.remove();
+}
+function toggleFind(c) { finds.has(c.id) ? closeFind(c) : openFind(c, false); }
+
+/** Ctrl+F / Ctrl+H: the selected card, else the one under the pointer. A selected snippet inside a file limits the search to its lines. */
+function openFindHere(replace) {
+  const ids = [...S.selected];
+  let c = null, within = null;
+  if (ids.length === 1) {
+    c = S.files.get(ids[0]) || S.snippets.get(ids[0]);
+    if (c?.fileId) { within = [c.start, c.end]; c = S.files.get(c.fileId); }
+  }
+  if (!c && lastPointer) c = cardFromEl(document.elementFromPoint(lastPointer.clientX, lastPointer.clientY) || root);
+  if (!c) { toast('Select a file or snippet (or point at one) to search in it.'); return; }
+  openFind(c, replace, '', within);
+}
+
+function openFind(c, replace, seed, within) {
+  if (S.editing === c) exitEdit();
+  let st = finds.get(c.id);
+  if (!st) { st = { q: '', rep: '', case: false, word: false, regex: false, keep: false, replace: false, within: null, cur: 0, hits: [], error: '' }; finds.set(c.id, st); buildFindBar(c, st); }
+  if (replace) st.replace = true;
+  if (within) st.within = within;
+  if (seed) { st.q = seed; st.cur = 0; }
+  st.wantFocus = replace && st.q ? 'rep' : 'find';
+  st.selectAll = true;
+  mountFind(c);
+}
+
+function buildFindBar(c, st) {
+  const tog = (label, title, key) => {
+    const b = h('button', { class: 'fb-tog', title }, label);
+    b.addEventListener('click', () => { if (key === 'within') toggleWithin(c); else { st[key] = !st[key]; refreshFind(c); } });
+    b.dataset.key = key;
+    return b;
+  };
+  const act = (label, title, fn) => { const b = h('button', { class: 'fb-act', title }, label); b.addEventListener('click', fn); return b; };
+  const findIn = h('input', { class: 'fb-in', placeholder: 'Find', spellcheck: 'false' });
+  const repIn = h('input', { class: 'fb-in', placeholder: 'Replace', spellcheck: 'false' });
+  const count = h('span', { class: 'fb-count' });
+  const more = h('button', { class: 'fb-more', title: 'Toggle Replace' }, '▸');
+  more.addEventListener('click', () => { st.replace = !st.replace; refreshFind(c); });
+  findIn.addEventListener('input', () => { st.q = findIn.value; st.cur = 0; refreshFind(c); revealHit(c); });
+  repIn.addEventListener('input', () => { st.rep = repIn.value; });
+  const keys = inRep => e => {
+    e.stopPropagation();
+    const ctrl = e.ctrlKey || e.metaKey, k = e.key.toLowerCase();
+    let used = true;
+    if (e.key === 'Escape') closeFind(c);
+    else if (e.key === 'Enter' && ctrl && (e.altKey || inRep)) replaceAll(c);
+    else if (e.key === 'Enter' && inRep) replaceOne(c);
+    else if (e.key === 'Enter' || e.key === 'F3') findStep(c, e.shiftKey ? -1 : 1);
+    else if (e.key === 'Tab' || e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      const toRep = e.key === 'Tab' ? !inRep : e.key === 'ArrowDown';
+      if (toRep) st.replace = true;
+      st.wantFocus = toRep ? 'rep' : 'find';
+      refreshFind(c);
+    }
+    else if (ctrl && k === 'f') findIn.select();
+    else if (ctrl && k === 'h') { st.replace = true; st.wantFocus = 'rep'; refreshFind(c); }
+    else if (e.altKey && k === 'c') { st.case = !st.case; refreshFind(c); }
+    else if (e.altKey && k === 'w') { st.word = !st.word; refreshFind(c); }
+    else if (e.altKey && k === 'r') { st.regex = !st.regex; refreshFind(c); }
+    else if (e.altKey && k === 'p') { st.keep = !st.keep; refreshFind(c); }
+    else if (e.altKey && k === 'l') toggleWithin(c);
+    else used = false;
+    if (used) e.preventDefault();
+  };
+  findIn.addEventListener('keydown', keys(false));
+  repIn.addEventListener('keydown', keys(true));
+  st.el = h('div', { class: 'find-bar' }, more,
+    h('div', { class: 'fb-rows' },
+      h('div', { class: 'fb-row' },
+        h('div', { class: 'fb-box' }, findIn, tog('Aa', 'Match Case (Alt+C)', 'case'), tog('ab', 'Match Whole Word (Alt+W)', 'word'), tog('.*', 'Use Regular Expression (Alt+R)', 'regex')),
+        count,
+        act('↑', 'Previous Match (Shift+Enter)', () => findStep(c, -1)), act('↓', 'Next Match (Enter)', () => findStep(c, 1)),
+        tog('≡', 'Find in Selection (Alt+L)', 'within'), act('×', 'Close (Escape)', () => closeFind(c))),
+      h('div', { class: 'fb-row fb-rep' },
+        h('div', { class: 'fb-box' }, repIn, tog('AB', 'Preserve Case (Alt+P)', 'keep')),
+        act('Replace', 'Replace (Enter)', () => replaceOne(c)), act('All', 'Replace All (Ctrl+Alt+Enter)', () => replaceAll(c)))));
+  for (const ev of ['pointerdown', 'dblclick', 'contextmenu', 'wheel']) st.el.addEventListener(ev, e => e.stopPropagation());
+  st.layer = h('div', { class: 'find-layer' });
+  Object.assign(st, { findIn, repIn, count, more });
+}
+
+/** Recompute the matches and redraw the bar and the highlights. */
+function refreshFind(c) {
+  const st = finds.get(c.id);
+  if (!st) return;
+  computeHits(c, st);
+  st.el.classList.toggle('with-replace', st.replace);
+  st.more.textContent = st.replace ? '▾' : '▸';
+  if (st.findIn.value !== st.q) st.findIn.value = st.q;
+  if (st.repIn.value !== st.rep) st.repIn.value = st.rep;
+  for (const b of st.el.querySelectorAll('.fb-tog')) b.classList.toggle('on', b.dataset.key === 'within' ? !!st.within : !!st[b.dataset.key]);
+  paintFind(c);
+  if (st.wantFocus) {
+    const inp = st.wantFocus === 'rep' ? st.repIn : st.findIn;
+    st.wantFocus = null;
+    inp.focus({ preventScroll: true });
+    if (st.selectAll) { st.selectAll = false; inp.select(); }
+  }
+}
+
+function paintFind(c) {
+  const st = finds.get(c.id);
+  if (!st) return;
+  const bad = !!st.error || (!!st.q && !st.hits.length);
+  st.count.textContent = st.error || (!st.q ? '' : !st.hits.length ? 'No results' : `${st.cur + 1} of ${st.hits.length}${st.hits.length >= MAX_HITS ? '+' : ''}`);
+  st.count.classList.toggle('bad', bad);
+  st.findIn.parentElement.classList.toggle('bad', bad);
+  const lines = findLines(c);
+  // highlights near the current match only: a card can hold thousands
+  const from = Math.max(0, st.cur - 1500), to = Math.min(st.hits.length, st.cur + 1500);
+  let html = '';
+  for (let i = from; i < to; i++) {
+    const hit = st.hits[i], line = lines[hit.line];
+    const a = visualCol(line, hit.start), b = visualCol(line, hit.end);
+    html += `<i class="${i === st.cur ? 'cur' : ''}" style="top:${PAD + hit.line * LH}px;left:calc(var(--gutter, 44px) + ${a}ch);width:${b - a}ch"></i>`;
+  }
+  st.layer.innerHTML = html;
+}
+
+/** Put a card's find bar and highlights back after the card was redrawn. */
+function mountFind(c) {
+  const st = finds.get(c.id);
+  if (!st || !c.el) return;
+  const active = document.activeElement;
+  if (!st.wantFocus && (active === st.findIn || active === st.repIn)) st.wantFocus = active === st.repIn ? 'rep' : 'find';
+  c.el.append(st.el);
+  if (c.bodyEl) c.bodyEl.prepend(st.layer);
+  st.el.style.top = HEAD + 'px'; // just under the header (the card may not be laid out yet, so no measuring)
+  refreshFind(c);
+}
+
+// =====================================================================
 // keyboard
 // =====================================================================
 function onKey(e) {
@@ -2643,6 +2932,7 @@ function onKey(e) {
   if (e.code === 'Space') { e.preventDefault(); if (!spaceDown) setSpace(true); return; }
   const ctrl = e.ctrlKey || e.metaKey;
   const P = AP();
+  if (ctrl && !e.altKey && (e.key.toLowerCase() === 'f' || e.key.toLowerCase() === 'h')) { e.preventDefault(); openFindHere(e.key.toLowerCase() === 'h'); return; }
   if (e.key === 'Escape') { if (cancelDrag()) return; cancelPick(); hideMenu(); clearAllSel(); clearSelection(); return; }
   if (ctrl && e.key === '\\') { e.preventDefault(); splitPane(P, e.shiftKey ? 'col' : 'row'); return; }
   if (ctrl && e.key.toLowerCase() === 's') {
