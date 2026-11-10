@@ -354,7 +354,8 @@ impl CanvasView {
             let slide = self.fx.slide(c.id);
             // an undocked card being dragged eases back from the slot it just left
             let unsnap = if ghost_card == Some(c.id) { self.fx.tween(Tw::Ghost, 0., 120.) } else { 0. };
-            let (sx, sy, sw, sh) = ((c.x + slide.0) * z + v.x, (c.y + slide.1 + rise + unsnap) * z + v.y, c.w * z, h_world * z);
+            // cards start on whole pixels, so their rows of text do too whenever the line pitch is whole
+            let (sx, sy, sw, sh) = (((c.x + slide.0) * z + v.x).round(), ((c.y + slide.1 + rise + unsnap) * z + v.y).round(), c.w * z, h_world * z);
             if sy > vh + 2000. * z || sy + sh < -600. || sx > vw + 900. || sx + sw + 900. * z < 0. { continue; }
             let selected = self.selected.contains(&c.id);
             let editing = self.editing == Some(c.id);

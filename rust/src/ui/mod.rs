@@ -173,6 +173,15 @@ pub(crate) fn mono() -> &'static str {
     if cfg!(windows) { "Consolas" } else if cfg!(target_os = "macos") { "Menlo" } else { "DejaVu Sans Mono" }
 }
 
+/// The nearest zoom at which a line of code is a whole number of pixels tall, so rows are evenly
+/// spaced when the view comes to rest. `fit` rounds down, to keep what was framed inside the view.
+/// Far-out zooms, where cards show only their name, are left alone.
+fn snap_zoom(z: f32, fit: bool) -> f32 {
+    if z < 0.3 { return z; }
+    let steps = z * LH;
+    ((if fit { steps.floor() } else { steps.round() }).max(1.) / LH).clamp(MIN_Z, (MAX_Z * LH).floor() / LH)
+}
+
 fn leaf_ids(l: &Layout, out: &mut Vec<u64>) {
     match l { Layout::Pane(p) => out.push(*p), Layout::Split { children, .. } => children.iter().for_each(|c| leaf_ids(c, out)) }
 }
@@ -279,7 +288,14 @@ impl CanvasView {
     pub(crate) fn toast(&mut self, s: impl Into<String>, err: bool) { self.toasts.push((s.into(), err, Instant::now())); }
     pub(crate) fn touch(&mut self) { self.state_dirty = Some(Instant::now()); }
     pub(crate) fn snapshot(&mut self) { self.undo.push(self.doc.clone()); if self.undo.len() > 60 { self.undo.remove(0); } self.redo.clear(); }
-    pub(crate) fn pv(&self, pane: u64) -> PaneView { self.views.get(&pane).copied().unwrap_or(self.views[&self.active]) }
+    /// A view as it is drawn and hit-tested: its offset on whole pixels. Text can only sit on whole
+    /// pixels vertically, so a canvas that glided by fractions would have its text jumping against its
+    /// cards; this way everything moves together. The stored view keeps its exact value for the easing.
+    pub(crate) fn pv(&self, pane: u64) -> PaneView {
+        let mut p = self.views.get(&pane).copied().unwrap_or(self.views[&self.active]);
+        p.v.x = p.v.x.round(); p.v.y = p.v.y.round();
+        p
+    }
     pub(crate) fn input(&mut self, k: Input) -> &mut TextBuffer { self.inputs.entry(k).or_default() }
     pub(crate) fn char_w(&self, z: f32) -> f32 { self.char_ratio * 12.5 * z }
     /// Glyph size for code at zoom `z`, in quarter-pixel steps: a zoom then reuses a bounded set of
@@ -461,7 +477,10 @@ impl CanvasView {
     pub(crate) fn on_wheel(&mut self, pane: u64, e: &ScrollWheelEvent, cx: &mut Context<Self>) {
         self.menu = None;
         self.active = pane;
-        let d = e.delta.pixel_delta(px(LH));
+        // A wheel notch arrives as three "lines"; 40 px each makes it the 120 px a browser scrolls,
+        // so the wheel covers the same distance (and zooms by the same amount) as the VS Code version.
+        let notched = matches!(e.delta, gpui::ScrollDelta::Lines(_));
+        let d = e.delta.pixel_delta(px(40.));
         let (dx, dy) = (fl(d.x), fl(d.y));
         let r = self.rect_of(pane);
         let shift_lines = matches!(self.drag, Some(Drag::ShiftLines { .. })) || self.live.as_ref().is_some_and(|l| l.lock);
@@ -469,6 +488,8 @@ impl CanvasView {
         if e.modifiers.control || e.modifiers.platform {
             p.anchor = (fl(e.position.x) - r.x, fl(e.position.y) - r.y);
             let nz = (p.t.z * (dy * 0.0016).exp()).clamp(MIN_Z, MAX_Z);
+            // a wheel lands on a zoom with a whole-pixel line pitch; a touchpad pinch stays continuous
+            let nz = if notched { let s = snap_zoom(nz, false); if s == p.t.z { snap_zoom(p.t.z + dy.signum() / LH, false) } else { s } } else { nz };
             let (a, t) = (p.anchor, &mut p.t);
             t.x = a.0 - (a.0 - t.x) * (nz / t.z); t.y = a.1 - (a.1 - t.y) * (nz / t.z); t.z = nz;
         } else if shift_lines {
@@ -484,6 +505,7 @@ impl CanvasView {
     pub(crate) fn frame(&mut self, pane: u64, x0: f32, y0: f32, x1: f32, y1: f32, max_z: f32) {
         let r = self.rect_of(pane);
         let z = ((r.w - 120.) / (x1 - x0).max(1.)).min((r.h - 120.) / (y1 - y0).max(1.)).clamp(MIN_Z, max_z);
+        let z = snap_zoom(z, true).min(max_z);
         let p = self.views.get_mut(&pane).unwrap();
         p.t = View { z, x: r.w / 2. - (x0 + x1) / 2. * z, y: r.h / 2. - (y0 + y1) / 2. * z };
         p.anchor = (r.w / 2., r.h / 2.);
@@ -510,7 +532,7 @@ impl CanvasView {
         let r = self.rect_of(self.active);
         let p = self.views.get_mut(&self.active).unwrap();
         p.anchor = (r.w / 2., r.h / 2.);
-        let nz = if f == 0. { 1. } else { (p.t.z * f).clamp(MIN_Z, MAX_Z) };
+        let nz = if f == 0. { 1. } else { snap_zoom((p.t.z * f).clamp(MIN_Z, MAX_Z), false) };
         let (a, t) = (p.anchor, &mut p.t);
         t.x = a.0 - (a.0 - t.x) * (nz / t.z); t.y = a.1 - (a.1 - t.y) * (nz / t.z); t.z = nz;
     }
