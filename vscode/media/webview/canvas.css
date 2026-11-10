@@ -87,7 +87,7 @@ button { font: inherit; color: inherit; }
 .pane.picking { cursor: crosshair; }
 .world { position: absolute; left: 0; top: 0; transform-origin: 0 0; will-change: transform; }
 .links { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; }
-.links path { fill: none; stroke: var(--snippet); stroke-width: calc(1.5px * var(--inv-z)); stroke-dasharray: calc(6px * var(--inv-z)) calc(5px * var(--inv-z)); opacity: .55; }
+.links path { fill: none; stroke: var(--snippet); stroke-width: 1.5px; stroke-dasharray: 6px 5px; vector-effect: non-scaling-stroke; opacity: .55; }
 .marquee { position: absolute; border: 1px solid var(--accent); background: var(--accent-soft); pointer-events: none; display: none; z-index: 10; }
 
 /* ---------- cards ---------- */
@@ -232,7 +232,7 @@ button { font: inherit; color: inherit; }
 .sel-tools button:hover { background: var(--hover); }
 
 /* ---------- overlays on the viewport ---------- */
-#ctxHistory { position: absolute; top: 10px; right: 10px; width: 290px; background: color-mix(in srgb, var(--panel) 94%, transparent); backdrop-filter: blur(6px); border: 1px solid var(--panel-border); border-radius: 9px; box-shadow: 0 8px 26px #0006; z-index: 500; font-size: 12px; user-select: none; }
+#ctxHistory { position: absolute; top: 10px; right: 10px; width: 290px; background: color-mix(in srgb, var(--panel) 94%, transparent); border: 1px solid var(--panel-border); border-radius: 9px; box-shadow: 0 8px 26px #0006; z-index: 500; font-size: 12px; user-select: none; }
 #ctxHistory .ch-head { display: flex; align-items: center; gap: 6px; padding: 7px 10px; cursor: pointer; }
 #ctxHistory .ch-head .t { font-weight: 600; flex: 1; }
 #ctxHistory .ch-head .sum { color: var(--muted); font-variant-numeric: tabular-nums; }
@@ -428,3 +428,7 @@ body.space-held .pane { cursor: grab; }
 .region .rbar .rh.top { top: -1px; }
 .region .rbar .rh.bot { bottom: -1px; }
 .region .rbar .rh:hover { background: color-mix(in srgb, var(--rc, var(--snippet)) 70%, transparent); border-radius: 2px; }
+
+/* ---------- performance ---------- */
+/* a card's insides never affect anything outside it, so reflowing one (live drags, edits) stays local */
+.card { contain: layout style; }

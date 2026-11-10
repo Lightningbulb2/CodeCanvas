@@ -56,7 +56,7 @@ Use the split buttons in the top bar, a view's hover bar (top-left), right-click
 - **A snippet's colour bar** (in a file): click it to select and highlight the snippet, or drag it to move the snippet (Alt+drag makes a reference). Drag its top or bottom edge (↕ cursor) to grow or shrink it a line at a time. Snippets it runs into are dissolved on release, and their code stays.
 - **Dissolving snippets:** right-click a file → *Dissolve all snippets in this file*, or right-click empty canvas → *Dissolve all snippets (every file)*.
 - **Shift + drag** on a line selection moves those lines up or down inside their file. They don't become a snippet, and the wheel scrolls vertically while you drag.
-- **Shift + drag** on a snippet's lines moves the snippet up or down inside its file, without selecting it first. A Shift + click that doesn't drag still multi-selects, on release.
+- **Shift + drag** on a snippet's lines grabs the snippet without selecting it first: move it inside its file, into another file, or out onto the canvas. A Shift + click that doesn't drag still multi-selects, on release.
 
 - **Space + drag:** moves any file or snippet, wherever you grab it. On empty canvas it pans.
 - **Selected snippets:** once a snippet in a file is selected (including one you just dropped in), you can drag it from anywhere on its lines.
