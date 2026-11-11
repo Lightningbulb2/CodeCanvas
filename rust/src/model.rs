@@ -125,8 +125,28 @@ impl Project {
 
     pub fn load_state(&self) -> Option<Saved> {
         let mut s: Saved = serde_json::from_slice(&fs::read(self.state_file()).ok()?).ok()?;
-        // an unedited file's text and its on-disk copy are one allocation again
-        for c in &mut s.doc.cards { if c.lines == c.disk { c.disk = c.lines.clone(); } }
+        // Files saved without their text (they had no unsaved edits) are read from disk again. One that
+        // has gone is dropped, with its snippets.
+        let mut gone = Vec::new();
+        for c in &mut s.doc.cards {
+            if c.lines.is_empty() {
+                match c.path.as_deref().and_then(|p| self.read(p)) {
+                    Some(text) => { c.lines = Lines::new(split_lines(&text)); c.disk = c.lines.clone(); }
+                    None => gone.push(c.id),
+                }
+            } else if c.lines == c.disk {
+                c.disk = c.lines.clone(); // an unedited file's text and its on-disk copy are one allocation again
+            }
+        }
+        s.doc.cards.retain(|c| !gone.contains(&c.id));
+        s.doc.regions.retain(|r| !gone.contains(&r.file));
+        // a file may have changed size while the app was closed: snippets stay inside it
+        for r in &mut s.doc.regions {
+            if let Some(n) = s.doc.cards.iter().find(|c| c.id == r.file).map(|c| c.lines.len()) {
+                r.end = r.end.min(n - 1);
+                r.start = r.start.min(r.end);
+            }
+        }
         Some(s)
     }
 }
@@ -289,6 +309,14 @@ pub fn guess_lang(lines: &[String]) -> String {
 }
 
 impl Doc {
+    /// The document as saved: files with no unsaved edits leave their text out (it is on disk), so the
+    /// state file and the copy the saver keeps hold only what can't be read back.
+    pub fn for_saving(&self) -> Doc {
+        let mut d = self.clone();
+        for c in d.cards.iter_mut().filter(|c| c.is_file() && !c.dirty()) { (c.lines, c.disk) = (Lines::default(), Lines::default()); }
+        d
+    }
+
     pub fn fresh_id(&mut self) -> u64 { self.next_id += 1; self.next_id }
     fn fresh_color(&self) -> u32 { COLORS[(self.next_id as usize) % COLORS.len()] }
 
@@ -732,6 +760,17 @@ mod tests {
         assert_eq!(*d.card(f).unwrap().lines, s(&["a", "B1", "B2", "c"]));
         assert_eq!(d.region(r).unwrap().end, 2);
         assert_eq!(*d.card(c).unwrap().lines, s(&["B1", "B2"]));
+    }
+
+    #[test]
+    fn saving_leaves_out_text_that_is_on_disk() {
+        let (mut d, f) = doc(&["a", "b"]);
+        let saved = d.for_saving();
+        assert!(saved.card(f).unwrap().lines.is_empty() && saved.card(f).unwrap().disk.is_empty());
+        d.card_mut(f).unwrap().lines_mut()[0] = "edited".into();
+        let saved = d.for_saving();
+        assert_eq!(*saved.card(f).unwrap().lines, s(&["edited", "b"]));
+        assert_eq!(*saved.card(f).unwrap().disk, s(&["a", "b"]));
     }
 
     #[test]

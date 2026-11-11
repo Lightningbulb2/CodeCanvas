@@ -881,7 +881,8 @@ impl Render for CanvasView {
         let (ex, ch) = (self.explorer_open, self.chat_open);
         self.side = (EXPLORER_W * self.fx.tween(Tw::Explorer, if ex { 1. } else { 0. }, 200.), CHAT_W * self.fx.tween(Tw::Chat, if ch { 1. } else { 0. }, 200.));
         self.step();
-        for id in self.pending_bottom.drain().collect::<Vec<_>>() { self.scroll_handle(id).scroll_to_bottom(); }
+        // chats in a virtualized list follow the bottom when they are drawn; the rest scroll here
+        for id in self.pending_bottom.iter().copied().filter(|id| !self.chat_lists.contains_key(id)).collect::<Vec<_>>() { self.pending_bottom.remove(&id); self.scroll_handle(id).scroll_to_bottom(); }
         let (rects, sashes) = self.pane_rects();
         let multi = rects.len() > 1;
         let panes: Vec<AnyElement> = rects.iter().map(|r| self.pane_el(r, multi, cx)).collect();
@@ -898,16 +899,29 @@ impl Render for CanvasView {
                     cx.stop_propagation();
                 })).into_any_element()
         }).collect();
-        let top = self.topbar(cx);
-        let explorer = (self.side.0 > 0.5).then(|| div().absolute().left_0().top(px(TOP)).bottom_0().w(px(self.side.0)).overflow_hidden().child(self.explorer(cx)));
-        let chat = (self.side.1 > 0.5).then(|| div().absolute().right_0().top(px(TOP)).bottom_0().w(px(self.side.1)).overflow_hidden().child(self.global_chat(cx)));
+        // the top bar, explorer and context panel are cached views: redrawn only when what they show changes
+        let keys: Vec<u64> = self.chrome.iter().map(|(part, ..)| self.chrome_key(*part)).collect();
+        for (i, key) in keys.into_iter().enumerate() {
+            if self.chrome[i].2 != key { self.chrome[i].2 = key; self.chrome[i].1.update(cx, |_, cx| cx.notify()); self.fx.want_frame = true; }
+        }
+        let view = |me: &Self, part: Part| gpui::AnyView::from(me.chrome.iter().find(|c| c.0 == part).unwrap().1.clone()).cached(gpui::StyleRefinement::default().size_full());
+        let top = div().absolute().left_0().top_0().w_full().h(px(TOP)).child(view(self, Part::Top));
+        let explorer = (self.side.0 > 0.5).then(|| div().absolute().left_0().top(px(TOP)).bottom_0().w(px(self.side.0)).overflow_hidden()
+            .child(div().w(px(EXPLORER_W)).h(px(self.win_size.1 - TOP)).child(view(self, Part::Explorer))));
+        // the chat panel is its own cached view: redrawn only when what it shows changes
+        let key = self.chat_key();
+        // A view told to redraw while this frame is being drawn redraws in the next one, so ask for it.
+        if key != self.chat_key { self.chat_key = key; self.chat_view.update(cx, |_, cx| cx.notify()); self.fx.want_frame = true; }
+        let chat = (self.side.1 > 0.5).then(|| div().absolute().right_0().top(px(TOP)).bottom_0().w(px(self.side.1)).overflow_hidden()
+            .child(div().w(px(CHAT_W)).h(px(self.win_size.1 - TOP)).child(gpui::AnyView::from(self.chat_view.clone()).cached(gpui::StyleRefinement::default().size_full()))));
         let toggles = [self.edge_toggle(true, ex, cx), self.edge_toggle(false, ch, cx)];
-        let ctx = self.context_panel(cx);
+        // (the wrapper is as tall as the panel can get; it has no handlers, so its empty part doesn't catch the mouse)
+        let ctx = div().absolute().right(px(self.side.1 + 10.)).top(px(TOP + 10.)).w(px(290.)).h(px((self.win_size.1 - TOP - 20.).max(40.))).child(view(self, Part::Context));
         let overlays = self.overlays_ui(cx);
         if std::mem::take(&mut self.fx.want_frame) { window.request_animation_frame(); }
         div().id("root").track_focus(&self.focus).on_key_down(cx.listener(Self::on_key)).on_key_up(cx.listener(Self::on_key_up))
             .on_mouse_move(cx.listener(Self::on_move)).on_mouse_up(MouseButton::Left, cx.listener(Self::on_up)).on_mouse_up(MouseButton::Middle, cx.listener(Self::on_up))
-            .relative().size_full().bg(col(BG)).text_color(col(FG)).text_size(tpx(13.))
+            .relative().size_full().bg(col(BG)).font_family(self.ui_font).text_color(col(FG)).text_size(tpx(13.))
             .children(panes).children(sash_els).child(top).children(explorer).children(chat).children(toggles).child(ctx).children(overlays)
     }
 }

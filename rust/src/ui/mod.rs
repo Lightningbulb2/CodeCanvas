@@ -95,6 +95,50 @@ pub(crate) struct Live {
     pub pane: u64,
 }
 
+/// The global chat panel as its own view, so GPUI can reuse last frame's drawing of it whenever
+/// something else on screen changes (scrolling or zooming the canvas). It draws through the canvas
+/// view, whose state it shows; the canvas tells it to redraw when that state changes (see `chat_key`).
+pub(crate) struct ChatPanelView { canvas: gpui::WeakEntity<CanvasView> }
+
+impl gpui::Render for ChatPanelView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+        let Some(canvas) = self.canvas.upgrade() else { return gpui::IntoElement::into_any_element(gpui::div()) };
+        let (el, animate) = canvas.update(cx, |t, cx| {
+            let before = std::mem::take(&mut t.fx.want_frame);
+            let el = t.global_chat(cx);
+            (el, std::mem::replace(&mut t.fx.want_frame, before))
+        });
+        // the typing dots animate: this view asks for its own next frame
+        if animate { window.request_animation_frame(); }
+        gpui::IntoElement::into_any_element(el)
+    }
+}
+
+/// A piece of the window's chrome drawn as its own cached view, like the chat panel: redrawn only
+/// when what it shows changes (see `chrome_keys`), not on every frame of canvas scrolling or zooming.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Part { Top, Explorer, Context }
+
+pub(crate) struct ChromeView { canvas: gpui::WeakEntity<CanvasView>, part: Part }
+
+impl gpui::Render for ChromeView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+        let Some(canvas) = self.canvas.upgrade() else { return gpui::IntoElement::into_any_element(gpui::div()) };
+        let part = self.part;
+        let (el, animate) = canvas.update(cx, |t, cx| {
+            let before = std::mem::take(&mut t.fx.want_frame);
+            let el = match part { Part::Top => t.topbar(cx), Part::Explorer => t.explorer(cx), Part::Context => t.context_panel(cx) };
+            (el, std::mem::replace(&mut t.fx.want_frame, before))
+        });
+        // e.g. a folder arrow turning: this view asks for its own next frame
+        if animate { window.request_animation_frame(); }
+        gpui::IntoElement::into_any_element(el)
+    }
+}
+
+/// A chat's virtualized message list, and what it was built from.
+pub(crate) struct ChatList { pub state: gpui::ListState, pub n: usize, pub last: Option<usize>, pub z: f32 }
+
 pub(crate) struct Busy { pub text: String, pub status: String, pub cancel: Cancel }
 
 pub(crate) enum Ev {
@@ -148,9 +192,17 @@ pub struct CanvasView {
     pub(crate) explorer_open: bool,
     pub(crate) hist_open: bool,
     /// Highlighting per card, with a fingerprint of the text it was computed from.
-    pub(crate) spans: HashMap<u64, (SpanKey, Rc<Spans>)>,
+    /// (what it was computed from, the highlighting, when it was last used)
+    pub(crate) spans: HashMap<u64, (SpanKey, Rc<Spans>, Instant)>,
     pub(crate) scrolls: HashMap<u64, ScrollHandle>,
     pub(crate) pending_bottom: HashSet<u64>,
+    pub(crate) chat_lists: HashMap<u64, ChatList>,
+    pub(crate) chat_view: gpui::Entity<ChatPanelView>,
+    /// The cached chrome views, and the fingerprint of what each showed when last told to redraw.
+    pub(crate) chrome: Vec<(Part, gpui::Entity<ChromeView>, u64)>,
+    pub(crate) ui_font: &'static str,
+    /// What the chat panel showed when last told to redraw.
+    chat_key: u64,
     pub(crate) space: bool,
     pub(crate) toasts: Vec<(String, bool, Instant)>,
     pub(crate) char_ratio: f32,
@@ -286,6 +338,10 @@ impl CanvasView {
         let ts = window.text_system();
         let id = ts.resolve_font(&font(mono()));
         let char_ratio = ts.advance(id, px(100.), 'm').map(|s| fl(s.width) / 100.).unwrap_or(0.6);
+        // The interface font. GPUI loads every face of a family into memory, and the usual default here,
+        // Noto Sans, has 72 of them (about 35 MB); these families have a handful.
+        let names = ts.all_font_names();
+        let ui_font = ["Liberation Sans", "DejaVu Sans"].into_iter().find(|f| names.iter().any(|n| n == f)).unwrap_or(".SystemUIFont");
         let pv = PaneView { v: View { x: 60., y: 60., z: 1. }, t: View { x: 60., y: 60., z: 1. }, anchor: (0., 0.) };
         let tree = project.tree();
         let mut this = Self {
@@ -293,7 +349,7 @@ impl CanvasView {
             drag: None, live: None, selected: HashSet::new(), picked: None, hover_tab: None, doomed: Vec::new(), undo: Vec::new(), redo: Vec::new(),
             inputs: HashMap::new(), focus_input: None, editing: None, busy: HashMap::new(), tx, rx, explaining: HashMap::new(), explain_queue: None, menu: None, pick: None,
             models: None, show_settings: false, show_help: false, expanded: HashSet::new(), chat_open: true, explorer_open: true, hist_open: true, spans: HashMap::new(), scrolls: HashMap::new(),
-            pending_bottom: HashSet::new(), space: false, toasts: Vec::new(), char_ratio, anim: HashMap::new(), fx: Fx::default(), finds: HashMap::new(), tiles: HashMap::new(), tile_shown: HashMap::new(), tile_levels: HashMap::new(), tile_pool: tiles::Pool::new(mono()), tile_inbox: Default::default(), frame: 0, scale: 1., dead_tiles: Vec::new(), dot_tiles: Vec::new(), ascii_glyphs: Default::default(), side: (EXPLORER_W, CHAT_W), sel_at: Instant::now(), started: Instant::now(), focus, win_size: (1500., 950.), mouse: (0., 0.), mods: Default::default(),
+            pending_bottom: HashSet::new(), chat_lists: HashMap::new(), chat_view: { let canvas = cx.weak_entity(); gpui::AppContext::new(cx, |_| ChatPanelView { canvas }) }, chat_key: 0, ui_font, chrome: [Part::Top, Part::Explorer, Part::Context].into_iter().map(|part| { let canvas = cx.weak_entity(); (part, gpui::AppContext::new(cx, |_| ChromeView { canvas, part }), 0) }).collect(), space: false, toasts: Vec::new(), char_ratio, anim: HashMap::new(), fx: Fx::default(), finds: HashMap::new(), tiles: HashMap::new(), tile_shown: HashMap::new(), tile_levels: HashMap::new(), tile_pool: tiles::Pool::new(mono()), tile_inbox: Default::default(), frame: 0, scale: 1., dead_tiles: Vec::new(), dot_tiles: Vec::new(), ascii_glyphs: Default::default(), side: (EXPLORER_W, CHAT_W), sel_at: Instant::now(), started: Instant::now(), focus, win_size: (1500., 950.), mouse: (0., 0.), mods: Default::default(),
             state_dirty: None, mtimes: HashMap::new(), last_poll: Instant::now(), inbox, saver, doc_dirty: true,
         };
         if let Some(s) = this.project.load_state() {
@@ -470,7 +526,7 @@ impl CanvasView {
         let json = |v: serde_json::Result<String>| v.unwrap_or_else(|_| "null".into());
         let rest = format!("\"layout\":{},\"views\":{},\"shared\":{},\"active\":{}", json(serde_json::to_string(&self.layout)), json(serde_json::to_string(&views)), self.shared, self.active);
         // cloning the document is cheap: card text is shared, not copied
-        let doc = std::mem::take(&mut self.doc_dirty).then(|| self.doc.clone());
+        let doc = std::mem::take(&mut self.doc_dirty).then(|| self.doc.for_saving());
         let _ = self.saver.send((doc, rest));
     }
 
@@ -1429,6 +1485,50 @@ impl CanvasView {
         std::thread::spawn(move || { let _ = tx.send(Ev::Models(list_models(&cfg))); });
     }
 
+/// A fingerprint of everything the global chat panel shows. When it changes, the panel is redrawn;
+    /// otherwise GPUI reuses its previous frame.
+    pub(crate) fn chat_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let g = &self.doc.global;
+        (g.chat.len(), g.chat.last().map(|m| Arc::as_ptr(&m.content) as *const u8 as usize)).hash(&mut h);
+        self.busy.get(&0).map(|b| (b.text.len(), b.status.clone())).hash(&mut h);
+        // an empty input box and none at all look the same (housekeeping drops empty ones)
+        self.inputs.get(&Input::Chat(0)).filter(|b| !b.is_empty() || self.focus_input == Some(Input::Chat(0))).map(|b| (b.lines.clone(), b.cur.line, b.cur.col, b.anchor.map(|a| (a.line, a.col)))).hash(&mut h);
+        (self.focus_input == Some(Input::Chat(0)), self.doc.ctx.len(), self.pending_bottom.contains(&0), self.win_size.1.to_bits()).hash(&mut h);
+        h.finish()
+    }
+
+/// A fingerprint of everything a chrome view shows. When it changes, that view is redrawn.
+    pub(crate) fn chrome_key(&self, part: Part) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.win_size.0.to_bits().hash(&mut h);
+        self.win_size.1.to_bits().hash(&mut h);
+        match part {
+            Part::Top => {
+                ((self.pv(self.active).v.z * 100.).round() as i64, self.any_dirty(), self.explain_queue.is_some(), self.shared, self.chat_open, self.show_help, self.explorer_open, self.models.is_some()).hash(&mut h);
+                (&self.settings.model, &self.settings.provider, &self.settings.endpoint).hash(&mut h);
+            }
+            Part::Explorer => {
+                self.tree.len().hash(&mut h);
+                (self.tree.first(), self.tree.last()).hash(&mut h);
+                let mut ex: Vec<&String> = self.expanded.iter().collect();
+                ex.sort();
+                ex.hash(&mut h);
+                self.inputs.get(&Input::Filter).map(|b| (b.lines.clone(), b.cur.line, b.cur.col, b.anchor.map(|a| (a.line, a.col)))).hash(&mut h);
+                (self.focus_input == Some(Input::Filter)).hash(&mut h);
+                // which files are on the canvas (their rows are highlighted)
+                self.doc.cards.iter().filter_map(|c| c.path.as_ref()).for_each(|p| p.hash(&mut h));
+            }
+            Part::Context => {
+                (self.hist_open, self.doc.history.len()).hash(&mut h);
+                for id in &self.doc.ctx { (id, self.doc.ctx_label(*id), self.doc.ctx_lines(*id)).hash(&mut h); }
+            }
+        }
+        h.finish()
+    }
+
     /// Whether anything is under way that the timer has to check on often.
     fn working(&self) -> bool { !self.busy.is_empty() || !self.explaining.is_empty() || self.tile_pool.in_flight > 0 || !self.tile_inbox.is_empty() || self.state_dirty.is_some() }
 
@@ -1457,11 +1557,13 @@ impl CanvasView {
     /// Drops caches that belong to cards and snippets which no longer exist.
     fn forget_closed(&mut self) {
         let alive: HashSet<u64> = self.doc.cards.iter().map(|c| c.id).chain(self.doc.regions.iter().map(|r| r.id)).chain([0, u64::MAX]).collect();
-        self.spans.retain(|id, _| alive.contains(id));
+        // highlighting of files that haven't been drawn for a while is redone when they come back
+        self.spans.retain(|id, e| alive.contains(id) && e.2.elapsed() < Duration::from_secs(30));
         self.scrolls.retain(|id, _| alive.contains(id) || alive.contains(&id.wrapping_sub(1 << 40)) || *id == u64::MAX - 1);
         self.mtimes.retain(|id, _| alive.contains(id));
         self.fx.forget_except(&alive);
         self.finds.retain(|id, _| alive.contains(id));
+        self.chat_lists.retain(|id, _| alive.contains(id));
         self.retire_tiles(|k, _| !alive.contains(&k.1));
         self.inputs.retain(|k, b| match k { Input::Chat(id) | Input::Ask(id) => alive.contains(id) && !b.is_empty(), _ => true });
     }
@@ -1695,16 +1797,16 @@ impl CanvasView {
 
     pub(crate) fn set_spans(&mut self, id: u64, lines: &[String], lang: &str) {
         let print = fingerprint(lines);
-        if self.spans.get(&id).is_some_and(|(p, _)| matches!(p, SpanKey::Print(x) if *x == print)) { return; }
-        self.spans.insert(id, (SpanKey::Print(print), Rc::new(highlight(lines, lang))));
+        if let Some(e) = self.spans.get_mut(&id).filter(|(p, ..)| matches!(p, SpanKey::Print(x) if *x == print)) { e.2 = Instant::now(); return; }
+        self.spans.insert(id, (SpanKey::Print(print), Rc::new(highlight(lines, lang)), Instant::now()));
     }
 
     /// The same for a card's own text. The cache holds on to the lines it highlighted, and shared lines
     /// are copied before they are written, so "the same allocation" means "the same text": checking
     /// costs nothing, however large the file.
     pub(crate) fn set_spans_shared(&mut self, id: u64, lines: &Lines, lang: &str) {
-        if self.spans.get(&id).is_some_and(|(p, _)| matches!(p, SpanKey::Shared(l) if Arc::ptr_eq(l, lines))) { return; }
-        self.spans.insert(id, (SpanKey::Shared(lines.clone()), Rc::new(highlight(lines, lang))));
+        if let Some(e) = self.spans.get_mut(&id).filter(|(p, ..)| matches!(p, SpanKey::Shared(l) if Arc::ptr_eq(l, lines))) { e.2 = Instant::now(); return; }
+        self.spans.insert(id, (SpanKey::Shared(lines.clone()), Rc::new(highlight(lines, lang)), Instant::now()));
     }
 }
 

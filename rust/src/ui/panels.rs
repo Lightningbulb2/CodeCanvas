@@ -4,7 +4,7 @@ use super::fx::{Rich, ease_out, ext_color, icon, ms_since};
 use super::render::*;
 use super::*;
 use crate::diff::{Op, diff_lines};
-use gpui::{AnyElement, Div, FontStyle, FontWeight, HighlightStyle, MouseButton, SharedString, StyledText, Transformation, div, prelude::*, radians, relative};
+use gpui::{AnyElement, Div, FontStyle, FontWeight, HighlightStyle, ListAlignment, ListOffset, ListState, MouseButton, SharedString, StyledText, Transformation, div, prelude::*, radians, relative};
 
 pub(crate) const SETTING_FIELDS: [&str; 12] = [
     "Provider (llamacpp, ollama, openai, anthropic)", "Endpoint (empty = provider default)", "Model", "Temperature", "Max tokens", "Tool calls per answer",
@@ -139,7 +139,7 @@ impl CanvasView {
         let model = self.settings.model.clone();
         let (shared, chat_on, help) = (self.shared, self.chat_open, self.show_help);
         let check = div().size(px(13.)).flex_none().flex().items_center().justify_center().rounded(px(3.)).border_1().border_color(col(if shared { ACCENT } else { MUTED })).when(shared, |d| d.bg(col(ACCENT)).child(icon("check", 10., col(0xffffff))));
-        div().absolute().left_0().top_0().w_full().h(px(TOP)).flex().items_center().gap(px(8.)).px(px(10.)).bg(col(PANEL)).border_b_1().border_color(col(PANEL_BORDER))
+        div().size_full().flex().items_center().gap(px(8.)).px(px(10.)).bg(col(PANEL)).border_b_1().border_color(col(PANEL_BORDER))
             .on_any_mouse_down(cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()))
             .child(div().flex().flex_none().items_center().gap(px(7.)).font_weight(FontWeight::SEMIBOLD).child(icon("logo", 16., col(SNIP))).child("CodeCanvas"))
             .child(div().text_color(col(MUTED)).whitespace_nowrap().overflow_hidden().child(name)).child(div().flex_1())
@@ -268,7 +268,7 @@ impl CanvasView {
                     let chip = |label: &'static str| div().px(px(6.)).rounded(px(4.)).bg(col(CARD)).border_1().border_color(col(BORDER)).text_size(tz(10.5, z)).cursor_pointer().hover(|s| s.bg(col(HOVER))).child(label);
                     d = d.child(div().group(group.clone()).relative().bg(col(INPUT)).border_1().border_color(col(BORDER)).rounded(px(6. * z)).px(px(10. * z)).py(px(8. * z)).overflow_hidden().font_family(mono()).text_size(tz(11.5, z))
                         .children(lines)
-                        .child(div().absolute().right(px(5.)).top(px(5.)).flex().gap(px(4.)).font_family(".SystemUIFont").opacity(0.).group_hover(group, |s| s.opacity(1.))
+                        .child(div().absolute().right(px(5.)).top(px(5.)).flex().gap(px(4.)).font_family(self.ui_font).opacity(0.).group_hover(group, |s| s.opacity(1.))
                             .when(is_snippet, |d| d.child(chip("→ Draft").on_mouse_down(MouseButton::Left, cx.listener(move |t, _: &MouseDownEvent, _, cx| {
                                 cx.stop_propagation();
                                 let o = t.doc.draft_owner(owner);
@@ -295,22 +295,41 @@ impl CanvasView {
         let is_file = self.doc.card(owner).is_some_and(Card::is_file);
         let title = self.doc.card(owner).map(|c| basename(&c.title).to_string()).or(self.doc.region(owner).map(|r| r.title.clone())).unwrap_or_else(|| "Chat".into());
         let color = self.doc.region(owner).map(|r| r.color).or(self.doc.card(owner).filter(|c| !c.is_file()).map(|c| c.color)).unwrap_or(ACCENT);
-        let handle = self.scroll_handle(owner);
-        let mut msgs = div().id(("msgs", owner)).overflow_y_scroll().track_scroll(&handle).flex().flex_col().gap(px(8. * z)).px(px(10. * z)).py(px(8. * z)).line_height(px(12.5 * 1.5 * z))
-            .when(fixed, |d| d.flex_1()).when(!fixed, |d| d.flex_auto().min_h(px(40. * z)))
-            .on_scroll_wheel(cx.listener(|_, e: &ScrollWheelEvent, _, cx| if !e.modifiers.control { cx.stop_propagation(); }));
-        if talk.chat.is_empty() && !self.busy.contains_key(&owner) {
-            msgs = msgs.child(div().text_color(col(MUTED)).text_size(tz(12., z)).child(if owner == 0 { "General chat, not tied to any snippet. It sees the global context (top right of the canvas) and can read any project file on its own.\n\nAsk it to draft code and the snippets will appear on the canvas, ready to drag into files." } else if is_file { "Ask anything about this whole file. File sends just this file; Global also sends everything in the context list." } else { "Ask anything about this snippet. Snippet sends only this code; Global also sends everything in the context list. Suggested changes land in the ✎ Draft tab as a diff." }));
-        }
-        for m in &talk.chat { msgs = msgs.child(self.message_el(owner, m.role, m.title.clone(), &m.content, z, cx)); }
-        let busy = self.busy.get(&owner).map(|b| (b.text.clone(), b.status.clone()));
-        if let Some((text, status)) = &busy {
-            if !text.is_empty() { msgs = msgs.child(self.message_el(owner, Role::Assistant, None, text, z, cx)); }
-            self.fx.want_frame = true;
-            let beat = ms_since(self.started) / 1000.;
-            let dots = (0..3).map(|i| { let p = ((beat - i as f32 * 0.15).fract() * std::f32::consts::TAU).cos(); div().size(px(5. * z)).rounded_full().bg(cola(MUTED, 0.6 - 0.4 * p)) });
-            msgs = msgs.child(div().flex().items_center().gap(px(3. * z)).py(px(4. * z)).children(dots).when(!status.is_empty(), |d| d.child(div().ml(px(6. * z)).text_color(col(MUTED)).text_size(tz(11., z)).italic().child(status.clone()))));
-        }
+        let busy = self.busy.get(&owner).map(|b| b.status.clone());
+        let intro = if owner == 0 { "General chat, not tied to any snippet. It sees the global context (top right of the canvas) and can read any project file on its own.\n\nAsk it to draft code and the snippets will appear on the canvas, ready to drag into files." } else if is_file { "Ask anything about this whole file. File sends just this file; Global also sends everything in the context list." } else { "Ask anything about this snippet. Snippet sends only this code; Global also sends everything in the context list. Suggested changes land in the ✎ Draft tab as a diff." };
+        let n = talk.chat.len();
+        let msgs = if fixed || n > 6 {
+            // Long conversations go through a virtualized list: only the messages in view are built, and
+            // a streaming answer re-measures just itself, so each token costs the same however long the
+            // chat is. Items: one per message, then a last one for the answer being written (or the intro).
+            let last = talk.chat.last().map(|m| Arc::as_ptr(&m.content) as *const u8 as usize);
+            let list = self.chat_lists.entry(owner).or_insert_with(|| ChatList { state: ListState::new(0, ListAlignment::Bottom, px(400.)), n: usize::MAX, last: None, z: z });
+            if list.n == usize::MAX || n < list.n || (n > list.n && list.n > 0 && talk.chat.get(list.n - 1).map(|m| Arc::as_ptr(&m.content) as *const u8 as usize) != list.last) || list.z != z {
+                // new, cleared, rewritten or zoomed: measure afresh, keeping the scroll position
+                let keep = (list.n != usize::MAX && list.z != z && n == list.n).then(|| list.state.logical_scroll_top());
+                list.state.reset(n + 1);
+                if let Some(top) = keep { list.state.scroll_to(top); }
+            } else if n > list.n {
+                list.state.splice(list.n..list.n + 1, n - list.n + 1);
+            } else if busy.is_some() {
+                list.state.splice(n..n + 1, 1); // the answer grew: re-measure only it
+            }
+            (list.n, list.last, list.z) = (n, last, z);
+            if self.pending_bottom.remove(&owner) { let c = list.state.item_count(); list.state.scroll_to(ListOffset { item_ix: c, offset_in_item: px(0.) }); }
+            let state = list.state.clone();
+            let items = gpui::list(state, cx.processor(move |t: &mut Self, ix: usize, _w, cx| t.chat_item(owner, ix, z, intro, cx).into_any_element())).size_full();
+            div().id(("msgs", owner)).min_h(px(40. * z)).when(fixed, |d| d.flex_1()).when(!fixed, |d| d.h(px((h - 86. * z).max(60. * z))))
+                .on_scroll_wheel(cx.listener(|_, e: &ScrollWheelEvent, _, cx| if !e.modifiers.control { cx.stop_propagation(); }))
+                .child(items)
+        } else {
+            // a short drawer chat: plain, so the drawer is as tall as what it holds
+            self.chat_lists.remove(&owner);
+            let handle = self.scroll_handle(owner);
+            let mut msgs = div().id(("msgs", owner)).overflow_y_scroll().track_scroll(&handle).flex().flex_col().flex_auto().min_h(px(40. * z))
+                .on_scroll_wheel(cx.listener(|_, e: &ScrollWheelEvent, _, cx| if !e.modifiers.control { cx.stop_propagation(); }));
+            for ix in 0..=n { msgs = msgs.child(self.chat_item_from(&talk, owner, ix, z, intro, cx)); }
+            msgs
+        };
         let focused = self.focus_input == Some(Input::Chat(owner));
         let input = self.input_el(Input::Chat(owner), if owner == 0 { "Ask about the project…" } else { "Ask…" }, 12.5 * z, cx);
         let running = busy.is_some();
@@ -342,6 +361,30 @@ impl CanvasView {
                     .on_mouse_down(MouseButton::Left, cx.listener(move |t, _: &MouseDownEvent, _, cx| { cx.stop_propagation(); if t.busy.contains_key(&owner) { t.stop_chat(owner); } else { t.submit_chat(owner); } cx.notify(); }))))
     }
 
+    /// Item `ix` of a chat as the virtualized list builds it (the conversation is in the document by then).
+    fn chat_item(&mut self, owner: u64, ix: usize, z: f32, intro: &'static str, cx: &mut Context<Self>) -> Div {
+        let talk = self.doc.talk_mut(owner).map(std::mem::take).unwrap_or_default();
+        let el = self.chat_item_from(&talk, owner, ix, z, intro, cx);
+        if let Some(t) = self.doc.talk_mut(owner) { *t = talk; }
+        el
+    }
+
+    /// One message (`ix` < count), or the last item: the answer being written, or the intro when empty.
+    fn chat_item_from(&mut self, talk: &Talk, owner: u64, ix: usize, z: f32, intro: &'static str, cx: &mut Context<Self>) -> Div {
+        let pad = |d: Div| div().px(px(10. * z)).pt(px(8. * z)).line_height(px(12.5 * 1.5 * z)).child(d);
+        if let Some(m) = talk.chat.get(ix) { return pad(self.message_el(owner, m.role, m.title.clone(), &m.content, z, cx)); }
+        let Some((text, status)) = self.busy.get(&owner).map(|b| (b.text.clone(), b.status.clone())) else {
+            return div().pb(px(8. * z)).when(talk.chat.is_empty(), |d| d.child(pad(div().text_color(col(MUTED)).text_size(tz(12., z)).child(intro))));
+        };
+        self.fx.want_frame = true;
+        let beat = ms_since(self.started) / 1000.;
+        let dots = (0..3).map(|i| { let p = ((beat - i as f32 * 0.15).fract() * std::f32::consts::TAU).cos(); div().size(px(5. * z)).rounded_full().bg(cola(MUTED, 0.6 - 0.4 * p)) });
+        let mut d = div().flex().flex_col().gap(px(8. * z));
+        if !text.is_empty() { d = d.child(self.message_el(owner, Role::Assistant, None, &text, z, cx)); }
+        d = d.child(div().flex().items_center().gap(px(3. * z)).py(px(4. * z)).children(dots).when(!status.is_empty(), |d| d.child(div().ml(px(6. * z)).text_color(col(MUTED)).text_size(tz(11., z)).italic().child(status))));
+        div().pb(px(8. * z)).child(pad(d))
+    }
+
     pub(crate) fn draft_panel(&mut self, id: u64, w: f32, z: f32, cx: &mut Context<Self>) -> Div {
         let owner = self.doc.draft_owner(id);
         let base = self.doc.base_lines(owner);
@@ -359,7 +402,7 @@ impl CanvasView {
         if editing {
             body = body.bg(col(INPUT)).child(div().px(px(10. * z)).py(px(6. * z)).child(self.input_el(Input::DraftEdit(owner), "", 12. * z, cx)));
         } else {
-            if add + del == 0 { body = body.child(div().font_family(".SystemUIFont").px(px(10. * z)).py(px(6. * z)).text_color(col(MUTED)).child("No changes yet. Click Edit, or ask the LLM below; suggested changes show up here as a diff you can Apply.")); }
+            if add + del == 0 { body = body.child(div().font_family(self.ui_font).px(px(10. * z)).py(px(6. * z)).text_color(col(MUTED)).child("No changes yet. Click Edit, or ask the LLM below; suggested changes show up here as a diff you can Apply.")); }
             for op in ops {
                 let (mark, tint, an, bn, line, spans) = match op {
                     Op::Same(a, b) => (" ", None, Some(a), Some(b), base[a].clone(), hb.line(a)),
@@ -382,7 +425,7 @@ impl CanvasView {
             .on_any_mouse_down(cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()))
             .child(div().flex().items_center().gap(px(6. * z)).px(px(8. * z)).py(px(5. * z)).border_b_1().border_color(col(BORDER))
                 .child(div().font_weight(FontWeight::MEDIUM).child("✎ Draft"))
-                .child(div().flex_1().font_family(mono()).text_size(tz(11., z)).flex().gap(px(4.)).when(add + del == 0, |d| d.font_family(".SystemUIFont").text_color(col(MUTED)).child("no changes")).when(add + del > 0, |d| d.font_weight(FontWeight::SEMIBOLD).child(div().text_color(col(OK)).child(format!("+{add}"))).child(div().text_color(col(BAD)).child(format!("−{del}")))))
+                .child(div().flex_1().font_family(mono()).text_size(tz(11., z)).flex().gap(px(4.)).when(add + del == 0, |d| d.font_family(self.ui_font).text_color(col(MUTED)).child("no changes")).when(add + del > 0, |d| d.font_weight(FontWeight::SEMIBOLD).child(div().text_color(col(OK)).child(format!("+{add}"))).child(div().text_color(col(BAD)).child(format!("−{del}")))))
                 .child(dbtn(if editing { "Done" } else { "Edit" }, false).on_mouse_down(MouseButton::Left, cx.listener(move |t, _: &MouseDownEvent, _, cx| { cx.stop_propagation(); if t.inputs.contains_key(&Input::DraftEdit(owner)) { t.focus_input = Some(Input::DraftEdit(owner)); t.commit_draft_edit(); } else { t.begin_draft_edit(id); } cx.notify(); })))
                 .child(tool("reset", 13. * z, MUTED, cx, move |t, _, _| t.reset_draft(id)))
                 .child(dbtn("Apply", true).on_mouse_down(MouseButton::Left, cx.listener(move |t, _: &MouseDownEvent, _, cx| { cx.stop_propagation(); t.apply_draft(id); cx.notify(); })))
@@ -397,11 +440,10 @@ impl CanvasView {
     }
 
     pub(crate) fn context_panel(&mut self, cx: &mut Context<Self>) -> Div {
-        let right = self.side.1 + 10.;
         let n = self.doc.ctx.len();
         let lines: usize = self.doc.ctx.iter().map(|i| self.doc.ctx_lines(*i)).sum();
         let open = self.hist_open;
-        let mut d = div().absolute().right(px(right)).top(px(TOP + 10.)).w(px(290.)).bg(cola(PANEL, 0.94)).border_1().border_color(col(PANEL_BORDER)).rounded(px(9.)).shadow(vec![shadow(8., 26., 0.4)]).text_size(tpx(12.))
+        let mut d = div().w(px(290.)).bg(cola(PANEL, 0.94)).border_1().border_color(col(PANEL_BORDER)).rounded(px(9.)).shadow(vec![shadow(8., 26., 0.4)]).text_size(tpx(12.))
             .on_any_mouse_down(cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()))
             .on_scroll_wheel(cx.listener(|_, _: &ScrollWheelEvent, _, cx| cx.stop_propagation()))
             .child(div().flex().items_center().gap(px(6.)).px(px(10.)).py(px(7.)).cursor_pointer().child(div().flex_1().font_weight(FontWeight::SEMIBOLD).child("Context"))
