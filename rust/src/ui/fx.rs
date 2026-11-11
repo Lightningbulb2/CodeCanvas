@@ -223,7 +223,8 @@ impl AssetSource for Icons {
     fn list(&self, _path: &str) -> gpui::Result<Vec<SharedString>> { Ok(Vec::new()) }
 }
 
-pub(crate) fn icon(name: &str, size: f32, color: Hsla) -> Svg { svg().path(format!("icons/{name}")).size(px(size)).flex_none().text_color(color) }
+/// An icon; its size is rounded to whole pixels, since GPUI rasterises an SVG afresh for every size.
+pub(crate) fn icon(name: &str, size: f32, color: Hsla) -> Svg { svg().path(format!("icons/{name}")).size(px(size.round().max(1.))).flex_none().text_color(color) }
 
 /// The colour dot the VS Code extension shows per file type.
 pub(crate) fn ext_color(path: &str) -> u32 {

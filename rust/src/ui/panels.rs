@@ -69,7 +69,7 @@ fn md_blocks(text: &str, z: f32) -> Div {
         let hashes = t.chars().take_while(|c| *c == '#').count();
         let numbered = t.find(['.', ')']).filter(|i| *i > 0 && *i <= 3 && t[..*i].chars().all(|c| c.is_ascii_digit()) && t[*i + 1..].starts_with(' '));
         if (1..=4).contains(&hashes) && t[hashes..].starts_with(' ') {
-            row = row.mt(px(4. * z)).font_weight(FontWeight::SEMIBOLD).text_size(tpx(13. * z)).child(line(t[hashes..].trim()));
+            row = row.mt(px(4. * z)).font_weight(FontWeight::SEMIBOLD).text_size(tz(13., z)).child(line(t[hashes..].trim()));
         } else if let Some(item) = t.strip_prefix("- ").or_else(|| t.strip_prefix("* ")) {
             row = row.flex().gap(px(6. * z)).pl(px(6. * z)).child(div().flex_none().text_color(col(MUTED)).child("•")).child(div().flex_1().min_w_0().child(line(item)));
         } else if let Some(i) = numbered {
@@ -243,7 +243,7 @@ impl CanvasView {
             Role::Error => return div().text_color(col(BAD)).child(content.to_string()),
             Role::Note => {
                 return div().bg(cola(SNIP, 0.16)).rounded(px(7. * z)).px(px(10. * z)).py(px(7. * z))
-                    .child(div().mb(px(2. * z)).text_size(tpx(10.5 * z)).text_color(col(MUTED)).child(title.unwrap_or("Explanation".into()).to_uppercase())).child(md_blocks(content, z));
+                    .child(div().mb(px(2. * z)).text_size(tz(10.5, z)).text_color(col(MUTED)).child(title.unwrap_or("Explanation".into()).to_uppercase())).child(md_blocks(content, z));
             }
             Role::Assistant => {}
         }
@@ -256,17 +256,17 @@ impl CanvasView {
                     let a = agent::attrs(&info);
                     let get = |k: &str| a.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
                     let wh = match get("file") { Some(f) => format!("{f}{}", get("replace").or(get("insert")).map_or(String::new(), |x| format!(":{x}"))), None => if is_snippet { "→ draft".into() } else { "unplaced".into() } };
-                    d = d.child(div().flex().items_center().gap(px(7. * z)).px(px(9. * z)).py(px(6. * z)).border_1().border_color(cola(SNIP, 0.45)).bg(cola(SNIP, 0.16)).rounded(px(7. * z)).text_size(tpx(12. * z))
+                    d = d.child(div().flex().items_center().gap(px(7. * z)).px(px(9. * z)).py(px(6. * z)).border_1().border_color(cola(SNIP, 0.45)).bg(cola(SNIP, 0.16)).rounded(px(7. * z)).text_size(tz(12., z))
                         .child(div().text_color(col(SNIP)).child("◆")).child(div().flex_1().font_weight(FontWeight::MEDIUM).child(get("title").unwrap_or("Draft snippet".into())))
-                        .child(div().text_color(col(MUTED)).font_family(mono()).text_size(tpx(11. * z)).child(if closed { wh } else { "drafting…".to_string() })));
+                        .child(div().text_color(col(MUTED)).font_family(mono()).text_size(tz(11., z)).child(if closed { wh } else { "drafting…".to_string() })));
                 }
                 Block::Code { info, body, .. } => {
                     let (b1, b2) = (body.clone(), body.clone());
                     let lang = info.split_whitespace().next().unwrap_or("").to_string();
                     let lines: Vec<AnyElement> = body.split('\n').map(|l| div().whitespace_nowrap().child(if l.is_empty() { " ".to_string() } else { l.replace('\t', "    ") }).into_any_element()).collect();
                     let group: SharedString = format!("pre{owner}-{n}").into();
-                    let chip = |label: &'static str| div().px(px(6.)).rounded(px(4.)).bg(col(CARD)).border_1().border_color(col(BORDER)).text_size(tpx(10.5 * z)).cursor_pointer().hover(|s| s.bg(col(HOVER))).child(label);
-                    d = d.child(div().group(group.clone()).relative().bg(col(INPUT)).border_1().border_color(col(BORDER)).rounded(px(6. * z)).px(px(10. * z)).py(px(8. * z)).overflow_hidden().font_family(mono()).text_size(tpx(11.5 * z))
+                    let chip = |label: &'static str| div().px(px(6.)).rounded(px(4.)).bg(col(CARD)).border_1().border_color(col(BORDER)).text_size(tz(10.5, z)).cursor_pointer().hover(|s| s.bg(col(HOVER))).child(label);
+                    d = d.child(div().group(group.clone()).relative().bg(col(INPUT)).border_1().border_color(col(BORDER)).rounded(px(6. * z)).px(px(10. * z)).py(px(8. * z)).overflow_hidden().font_family(mono()).text_size(tz(11.5, z))
                         .children(lines)
                         .child(div().absolute().right(px(5.)).top(px(5.)).flex().gap(px(4.)).font_family(".SystemUIFont").opacity(0.).group_hover(group, |s| s.opacity(1.))
                             .when(is_snippet, |d| d.child(chip("→ Draft").on_mouse_down(MouseButton::Left, cx.listener(move |t, _: &MouseDownEvent, _, cx| {
@@ -300,7 +300,7 @@ impl CanvasView {
             .when(fixed, |d| d.flex_1()).when(!fixed, |d| d.flex_auto().min_h(px(40. * z)))
             .on_scroll_wheel(cx.listener(|_, e: &ScrollWheelEvent, _, cx| if !e.modifiers.control { cx.stop_propagation(); }));
         if talk.chat.is_empty() && !self.busy.contains_key(&owner) {
-            msgs = msgs.child(div().text_color(col(MUTED)).text_size(tpx(12. * z)).child(if owner == 0 { "General chat, not tied to any snippet. It sees the global context (top right of the canvas) and can read any project file on its own.\n\nAsk it to draft code and the snippets will appear on the canvas, ready to drag into files." } else if is_file { "Ask anything about this whole file. File sends just this file; Global also sends everything in the context list." } else { "Ask anything about this snippet. Snippet sends only this code; Global also sends everything in the context list. Suggested changes land in the ✎ Draft tab as a diff." }));
+            msgs = msgs.child(div().text_color(col(MUTED)).text_size(tz(12., z)).child(if owner == 0 { "General chat, not tied to any snippet. It sees the global context (top right of the canvas) and can read any project file on its own.\n\nAsk it to draft code and the snippets will appear on the canvas, ready to drag into files." } else if is_file { "Ask anything about this whole file. File sends just this file; Global also sends everything in the context list." } else { "Ask anything about this snippet. Snippet sends only this code; Global also sends everything in the context list. Suggested changes land in the ✎ Draft tab as a diff." }));
         }
         for m in &talk.chat { msgs = msgs.child(self.message_el(owner, m.role, m.title.clone(), &m.content, z, cx)); }
         let busy = self.busy.get(&owner).map(|b| (b.text.clone(), b.status.clone()));
@@ -309,7 +309,7 @@ impl CanvasView {
             self.fx.want_frame = true;
             let beat = ms_since(self.started) / 1000.;
             let dots = (0..3).map(|i| { let p = ((beat - i as f32 * 0.15).fract() * std::f32::consts::TAU).cos(); div().size(px(5. * z)).rounded_full().bg(cola(MUTED, 0.6 - 0.4 * p)) });
-            msgs = msgs.child(div().flex().items_center().gap(px(3. * z)).py(px(4. * z)).children(dots).when(!status.is_empty(), |d| d.child(div().ml(px(6. * z)).text_color(col(MUTED)).text_size(tpx(11. * z)).italic().child(status.clone()))));
+            msgs = msgs.child(div().flex().items_center().gap(px(3. * z)).py(px(4. * z)).children(dots).when(!status.is_empty(), |d| d.child(div().ml(px(6. * z)).text_color(col(MUTED)).text_size(tz(11., z)).italic().child(status.clone()))));
         }
         let focused = self.focus_input == Some(Input::Chat(owner));
         let input = self.input_el(Input::Chat(owner), if owner == 0 { "Ask about the project…" } else { "Ask…" }, 12.5 * z, cx);
@@ -324,16 +324,16 @@ impl CanvasView {
         } else {
             let seg = |label: &'static str, on: bool, to: bool, cx: &mut Context<Self>| div().px(px(8. * z)).py(px(2. * z)).cursor_pointer().text_color(col(if on { FG } else { MUTED })).when(on, |d| d.bg(cola(ACCENT, 0.22))).child(label)
                 .on_mouse_down(MouseButton::Left, cx.listener(move |t, _: &MouseDownEvent, _, cx| { cx.stop_propagation(); if let Some(x) = t.doc.talk_mut(owner) { x.global = to; } t.touch(); cx.notify(); }));
-            div().flex().items_center().gap(px(6. * z)).px(px(8. * z)).py(px(5. * z)).border_b_1().border_color(col(BORDER)).text_size(tpx(12. * z))
+            div().flex().items_center().gap(px(6. * z)).px(px(8. * z)).py(px(5. * z)).border_b_1().border_color(col(BORDER)).text_size(tz(12., z))
                 .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().font_weight(FontWeight::MEDIUM).child(title))
-                .child(div().flex().flex_none().border_1().border_color(col(BORDER)).rounded(px(6. * z)).overflow_hidden().text_size(tpx(11. * z)).child(seg(if is_file { "File" } else { "Snippet" }, !global, false, cx)).child(seg("Global", global, true, cx)))
+                .child(div().flex().flex_none().border_1().border_color(col(BORDER)).rounded(px(6. * z)).overflow_hidden().text_size(tz(11., z)).child(seg(if is_file { "File" } else { "Snippet" }, !global, false, cx)).child(seg("Global", global, true, cx)))
                 .child(tool("reset", 13. * z, MUTED, cx, move |t, _, _| t.reset_chat(owner)))
                 .child(tool("close", 13. * z, MUTED, cx, move |t, _, _| t.toggle_chat(owner)))
         };
         let side = if owner == 0 { PANEL_BORDER } else { BORDER };
         let shell = if fixed { div().w(px(w)).h(px(h)).bg(col(PANEL)).border_l_1().border_color(col(PANEL_BORDER)) }
             else { div().relative().w(px(w)).max_h(px(h)).pl(px(3. * z)).bg(col(CARD)).border_1().border_l_0().border_color(col(BORDER)).rounded_r(px(9. * z)).child(div().absolute().left_0().top_0().bottom_0().w(px(3. * z)).bg(col(color))) };
-        shell.flex().flex_col().text_size(tpx(12.5 * z)).text_color(col(FG))
+        shell.flex().flex_col().text_size(tz(12.5, z)).text_color(col(FG))
             .on_any_mouse_down(cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()))
             .child(head).child(msgs)
             .child(div().flex().flex_none().gap(px(6. * z)).p(px(7. * z)).items_end().border_t_1().border_color(col(side))
@@ -354,7 +354,7 @@ impl CanvasView {
         let color = self.doc.region(owner).map(|r| r.color).or(self.doc.card(owner).map(|c| c.color)).unwrap_or(ACCENT);
         let editing = self.focus_input == Some(Input::DraftEdit(owner)) || self.inputs.contains_key(&Input::DraftEdit(owner));
         let h_handle = self.scroll_handle(owner.wrapping_add(1 << 40));
-        let mut body = div().id(("draft", owner)).max_h(px(360. * z)).min_h(px(40. * z)).overflow_y_scroll().track_scroll(&h_handle).font_family(mono()).text_size(tpx(12. * z)).line_height(px(LH * z))
+        let mut body = div().id(("draft", owner)).max_h(px(360. * z)).min_h(px(40. * z)).overflow_y_scroll().track_scroll(&h_handle).font_family(mono()).text_size(tz(12., z)).line_height(px(LH * z))
             .on_scroll_wheel(cx.listener(|_, e: &ScrollWheelEvent, _, cx| if !e.modifiers.control { cx.stop_propagation(); }));
         if editing {
             body = body.bg(col(INPUT)).child(div().px(px(10. * z)).py(px(6. * z)).child(self.input_el(Input::DraftEdit(owner), "", 12. * z, cx)));
@@ -362,9 +362,9 @@ impl CanvasView {
             if add + del == 0 { body = body.child(div().font_family(".SystemUIFont").px(px(10. * z)).py(px(6. * z)).text_color(col(MUTED)).child("No changes yet. Click Edit, or ask the LLM below; suggested changes show up here as a diff you can Apply.")); }
             for op in ops {
                 let (mark, tint, an, bn, line, spans) = match op {
-                    Op::Same(a, b) => (" ", None, Some(a), Some(b), base[a].clone(), hb.get(a)),
-                    Op::Del(a) => ("−", Some(BAD), Some(a), None, base[a].clone(), hb.get(a)),
-                    Op::Add(b) => ("+", Some(OK), None, Some(b), draft[b].clone(), hd.get(b)),
+                    Op::Same(a, b) => (" ", None, Some(a), Some(b), base[a].clone(), hb.line(a)),
+                    Op::Del(a) => ("−", Some(BAD), Some(a), None, base[a].clone(), hb.line(a)),
+                    Op::Add(b) => ("+", Some(OK), None, Some(b), draft[b].clone(), hd.line(b)),
                 };
                 let (text, hl) = display_line(&line, spans);
                 let num = |n: Option<usize>| div().w(px(30. * z)).flex_none().flex().justify_end().pr(px(6. * z)).text_color(cola(MUTED, 0.7)).child(n.map_or(String::new(), |n| (start + n).to_string()));
@@ -376,13 +376,13 @@ impl CanvasView {
         }
         let focused = self.focus_input == Some(Input::Ask(id));
         let ask = self.input_el(Input::Ask(id), "Ask the LLM for a change… (Enter)", 12. * z, cx);
-        let dbtn = |label: &'static str, primary: bool| div().px(px(9. * z)).py(px(2. * z)).rounded(px(5. * z)).border_1().border_color(col(if primary { BTN } else { BORDER })).when(primary, |d| d.bg(col(BTN)).text_color(col(0xffffff))).text_size(tpx(11.5 * z)).cursor_pointer().hover(|s| s.bg(col(if primary { ACCENT } else { HOVER }))).child(label);
-        div().relative().w(px(w)).pl(px(3. * z)).flex().flex_col().bg(col(CARD)).border_1().border_l_0().border_color(col(BORDER)).rounded_r(px(9. * z)).text_size(tpx(12. * z)).text_color(col(FG))
+        let dbtn = |label: &'static str, primary: bool| div().px(px(9. * z)).py(px(2. * z)).rounded(px(5. * z)).border_1().border_color(col(if primary { BTN } else { BORDER })).when(primary, |d| d.bg(col(BTN)).text_color(col(0xffffff))).text_size(tz(11.5, z)).cursor_pointer().hover(|s| s.bg(col(if primary { ACCENT } else { HOVER }))).child(label);
+        div().relative().w(px(w)).pl(px(3. * z)).flex().flex_col().bg(col(CARD)).border_1().border_l_0().border_color(col(BORDER)).rounded_r(px(9. * z)).text_size(tz(12., z)).text_color(col(FG))
             .child(div().absolute().left_0().top_0().bottom_0().w(px(3. * z)).bg(col(color)))
             .on_any_mouse_down(cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()))
             .child(div().flex().items_center().gap(px(6. * z)).px(px(8. * z)).py(px(5. * z)).border_b_1().border_color(col(BORDER))
                 .child(div().font_weight(FontWeight::MEDIUM).child("✎ Draft"))
-                .child(div().flex_1().font_family(mono()).text_size(tpx(11. * z)).flex().gap(px(4.)).when(add + del == 0, |d| d.font_family(".SystemUIFont").text_color(col(MUTED)).child("no changes")).when(add + del > 0, |d| d.font_weight(FontWeight::SEMIBOLD).child(div().text_color(col(OK)).child(format!("+{add}"))).child(div().text_color(col(BAD)).child(format!("−{del}")))))
+                .child(div().flex_1().font_family(mono()).text_size(tz(11., z)).flex().gap(px(4.)).when(add + del == 0, |d| d.font_family(".SystemUIFont").text_color(col(MUTED)).child("no changes")).when(add + del > 0, |d| d.font_weight(FontWeight::SEMIBOLD).child(div().text_color(col(OK)).child(format!("+{add}"))).child(div().text_color(col(BAD)).child(format!("−{del}")))))
                 .child(dbtn(if editing { "Done" } else { "Edit" }, false).on_mouse_down(MouseButton::Left, cx.listener(move |t, _: &MouseDownEvent, _, cx| { cx.stop_propagation(); if t.inputs.contains_key(&Input::DraftEdit(owner)) { t.focus_input = Some(Input::DraftEdit(owner)); t.commit_draft_edit(); } else { t.begin_draft_edit(id); } cx.notify(); })))
                 .child(tool("reset", 13. * z, MUTED, cx, move |t, _, _| t.reset_draft(id)))
                 .child(dbtn("Apply", true).on_mouse_down(MouseButton::Left, cx.listener(move |t, _: &MouseDownEvent, _, cx| { cx.stop_propagation(); t.apply_draft(id); cx.notify(); })))

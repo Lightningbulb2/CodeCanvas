@@ -39,7 +39,7 @@ const MIN_Z: f32 = 0.04;
 const MAX_Z: f32 = 2.5;
 
 pub(crate) type Act = Rc<dyn Fn(&mut CanvasView, &mut Window, &mut Context<CanvasView>)>;
-pub(crate) type Spans = Vec<Vec<(Range<usize>, Tok)>>;
+pub(crate) use crate::highlight::Spans;
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Input { Chat(u64), Ask(u64), DraftEdit(u64), Editor(u64), Filter, Find(u64), Replace(u64), Rename(u64), Setting(usize) }
@@ -159,13 +159,20 @@ pub struct CanvasView {
     /// Open find bars, by card.
     pub(crate) finds: HashMap<u64, find::Find>,
     /// Cached text bitmaps, by (view, card, tile index). See `tiles.rs`.
-    pub(crate) tiles: HashMap<(u64, u64, usize), tiles::Tile>,
-    pub(crate) raster: Arc<std::sync::Mutex<Option<tiles::Raster>>>,
-    /// Tiles that may still be drawn this frame, so a burst of new ones can't stall it.
-    pub(crate) tile_budget: usize,
+    pub(crate) tiles: HashMap<tiles::Key, tiles::Cell>,
+    /// The zoom each card (per view) was last drawn completely from.
+    pub(crate) tile_shown: HashMap<(u64, u64), f32>,
+    /// The zoom levels each card (per view) has drawn cells at, rebuilt every frame.
+    pub(crate) tile_levels: HashMap<(u64, u64), Vec<f32>>,
+    pub(crate) tile_pool: tiles::Pool,
+    /// Finished tiles waiting for their turn to be uploaded.
+    pub(crate) tile_inbox: std::collections::VecDeque<tiles::Done>,
     pub(crate) frame: u64,
     pub(crate) scale: f32,
     pub(crate) dead_tiles: Vec<Arc<gpui::RenderImage>>,
+    /// Dot-grid tiles by dot spacing in device pixels, most recent last.
+    pub(crate) dot_tiles: Vec<(u32, Arc<gpui::RenderImage>)>,
+    pub(crate) ascii_glyphs: Rc<std::cell::RefCell<render::AsciiGlyphs>>,
     /// Current widths of the explorer and the global chat (they slide open and shut).
     pub(crate) side: (f32, f32),
     pub(crate) sel_at: Instant,
@@ -271,12 +278,11 @@ impl CanvasView {
             });
         }
         cx.spawn(async move |this, cx| loop {
-            cx.background_executor().timer(Duration::from_millis(33)).await;
-            if this.update(cx, |t, cx| if t.pump() { cx.notify(); }).is_err() { break; }
+            // Quick while something is running (a chat answering, Explain, text being drawn), otherwise a
+            // few times a second, which is plenty for files changing on disk and requests from Zed.
+            let Ok(busy) = this.update(cx, |t, cx| { if t.pump() { cx.notify(); } t.working() }) else { break };
+            cx.background_executor().timer(Duration::from_millis(if busy { 33 } else { 250 })).await;
         }).detach();
-        // the tile rasteriser loads the system fonts, so it gets ready on its own thread
-        let raster: Arc<std::sync::Mutex<Option<tiles::Raster>>> = Arc::default();
-        { let r = raster.clone(); std::thread::spawn(move || { let made = tiles::Raster::new(mono()); *r.lock().unwrap() = made; }); }
         let ts = window.text_system();
         let id = ts.resolve_font(&font(mono()));
         let char_ratio = ts.advance(id, px(100.), 'm').map(|s| fl(s.width) / 100.).unwrap_or(0.6);
@@ -287,7 +293,7 @@ impl CanvasView {
             drag: None, live: None, selected: HashSet::new(), picked: None, hover_tab: None, doomed: Vec::new(), undo: Vec::new(), redo: Vec::new(),
             inputs: HashMap::new(), focus_input: None, editing: None, busy: HashMap::new(), tx, rx, explaining: HashMap::new(), explain_queue: None, menu: None, pick: None,
             models: None, show_settings: false, show_help: false, expanded: HashSet::new(), chat_open: true, explorer_open: true, hist_open: true, spans: HashMap::new(), scrolls: HashMap::new(),
-            pending_bottom: HashSet::new(), space: false, toasts: Vec::new(), char_ratio, anim: HashMap::new(), fx: Fx::default(), finds: HashMap::new(), tiles: HashMap::new(), raster, tile_budget: 0, frame: 0, scale: 1., dead_tiles: Vec::new(), side: (EXPLORER_W, CHAT_W), sel_at: Instant::now(), started: Instant::now(), focus, win_size: (1500., 950.), mouse: (0., 0.), mods: Default::default(),
+            pending_bottom: HashSet::new(), space: false, toasts: Vec::new(), char_ratio, anim: HashMap::new(), fx: Fx::default(), finds: HashMap::new(), tiles: HashMap::new(), tile_shown: HashMap::new(), tile_levels: HashMap::new(), tile_pool: tiles::Pool::new(mono()), tile_inbox: Default::default(), frame: 0, scale: 1., dead_tiles: Vec::new(), dot_tiles: Vec::new(), ascii_glyphs: Default::default(), side: (EXPLORER_W, CHAT_W), sel_at: Instant::now(), started: Instant::now(), focus, win_size: (1500., 950.), mouse: (0., 0.), mods: Default::default(),
             state_dirty: None, mtimes: HashMap::new(), last_poll: Instant::now(), inbox, saver, doc_dirty: true,
         };
         if let Some(s) = this.project.load_state() {
@@ -1063,7 +1069,7 @@ impl CanvasView {
     fn fly(&mut self, pane: u64, lines: &[String], lang: &str, from: (f32, f32), to: (f32, f32), color: u32) -> f32 {
         let lines = &lines[..lines.len().min(140)];
         let hl = highlight(lines, lang);
-        let rows = lines.iter().enumerate().map(|(i, l)| render::display_line(l, hl.get(i))).collect();
+        let rows = lines.iter().enumerate().map(|(i, l)| render::display_line(l, hl.line(i))).collect();
         let f = Fly { pane, rows, from, to, color, at: Instant::now() };
         let t = f.total();
         self.fx.flies.push(f);
@@ -1395,7 +1401,7 @@ impl CanvasView {
     pub(crate) fn send_chat(&mut self, owner: u64, text: String) {
         let Some(t) = self.doc.talk_mut(owner) else { return };
         t.chat.push(ChatMsg::new(Role::User, text));
-        let history: Vec<Message> = t.chat.iter().filter(|m| m.role != Role::Error).map(|m| Message { role: if m.role == Role::User { "user" } else { "assistant" }, content: m.content.clone() }).collect();
+        let history: Vec<Message> = t.chat.iter().filter(|m| m.role != Role::Error).map(|m| Message { role: if m.role == Role::User { "user" } else { "assistant" }, content: m.content.to_string() }).collect();
         let (context, focus) = self.context_for(owner);
         let cancel: Cancel = Arc::new(AtomicBool::new(false));
         self.busy.insert(owner, Busy { text: String::new(), status: String::new(), cancel: cancel.clone() });
@@ -1422,6 +1428,9 @@ impl CanvasView {
         let (cfg, tx) = (self.settings.llm(), self.tx.clone());
         std::thread::spawn(move || { let _ = tx.send(Ev::Models(list_models(&cfg))); });
     }
+
+    /// Whether anything is under way that the timer has to check on often.
+    fn working(&self) -> bool { !self.busy.is_empty() || !self.explaining.is_empty() || self.tile_pool.in_flight > 0 || !self.tile_inbox.is_empty() || self.state_dirty.is_some() }
 
     /// Runs on a short timer: drains LLM events and does periodic chores.
     fn pump(&mut self) -> bool {
@@ -1457,24 +1466,61 @@ impl CanvasView {
         self.inputs.retain(|k, b| match k { Input::Chat(id) | Input::Ask(id) => alive.contains(id) && !b.is_empty(), _ => true });
     }
 
-    /// Drops the tiles `gone` picks; their images are released at the next frame.
-    pub(crate) fn retire_tiles(&mut self, gone: impl Fn(&(u64, u64, usize), &tiles::Tile) -> bool) {
+    /// Drops the cells `gone` picks; their images are released at the next frame.
+    pub(crate) fn retire_tiles(&mut self, gone: impl Fn(&tiles::Key, &tiles::Cell) -> bool) {
         let dead = &mut self.dead_tiles;
-        self.tiles.retain(|k, t| { let drop = gone(k, t); if drop { dead.extend(t.img.take()); } !drop });
+        self.tiles.retain(|k, c| { let drop = gone(k, c); if drop { dead.extend(c.img.take()); } !drop });
     }
 
-    /// Once per frame: forget tiles nothing has drawn for a while, and keep the cache within its budget.
-    pub(crate) fn trim_tiles(&mut self) {
-        const BUDGET: usize = 192 << 20;
-        let frame = self.frame;
-        self.retire_tiles(|_, t| frame.saturating_sub(t.used) > 240);
-        let total: usize = self.tiles.values().map(|t| t.bytes).sum();
-        if total > BUDGET {
-            let mut ages: Vec<u64> = self.tiles.values().map(|t| t.used).collect();
-            ages.sort_unstable();
-            let cut = ages[ages.len() / 3];
-            self.retire_tiles(|_, t| t.used <= cut && t.used != frame);
+    /// The dot-grid tile for a dot spacing (device pixels), made once and kept for the last few spacings.
+    pub(crate) fn dot_tile(&mut self, gap: u32) -> Option<(Arc<gpui::RenderImage>, u32)> {
+        let per = (512 / gap.max(1)).clamp(1, 16);
+        if let Some(i) = self.dot_tiles.iter().position(|(g, _)| *g == gap) {
+            let t = self.dot_tiles.remove(i);
+            self.dot_tiles.push(t);
+        } else {
+            let img = tiles::dot_tile(gap, per, render::FG, 0.13)?;
+            self.dot_tiles.push((gap, img));
+            if self.dot_tiles.len() > 6 { let (_, old) = self.dot_tiles.remove(0); self.dead_tiles.push(old); }
         }
+        self.dot_tiles.last().map(|(_, img)| (img.clone(), per))
+    }
+
+    /// Once per frame: take in the cells the workers finished (a few per frame, see `UPLOAD_PER_FRAME`),
+    /// forget cells nothing has drawn for half a second (they are quick to redo), and keep the rest
+    /// within a memory budget.
+    pub(crate) fn tend_tiles(&mut self) {
+        // About four screens of cells: what is in view (cards round up to whole cells), plus the zoom
+        // being moved toward. GPUI keeps a copy of each in memory as well as on the GPU.
+        let budget = ((self.win_size.0 * self.win_size.1 * self.scale * self.scale * 4. * 4.) as usize).max(16 << 20);
+        let finished = self.tile_pool.finished();
+        self.tile_inbox.extend(finished);
+        let mut taken = 0;
+        while taken < tiles::UPLOAD_PER_FRAME {
+            let Some(d) = self.tile_inbox.pop_front() else { break };
+            let Some(c) = self.tiles.get_mut(&d.key) else { continue };
+            // drawn from text that has since changed: thrown away
+            if !(Arc::ptr_eq(&c.lines, &d.lines) && c.start_no == d.start_no && c.scale == d.scale) { continue; }
+            c.asked = false;
+            match d.img { Some(img) => { c.img = Some(img); taken += 1; } None => c.missing = true }
+        }
+        if !self.tile_inbox.is_empty() || self.tile_pool.in_flight > 0 { self.fx.want_frame = true; }
+        let frame = self.frame;
+        self.retire_tiles(|_, c| frame.saturating_sub(c.used) > 20 && !c.asked);
+        let total: usize = self.tiles.values().map(tiles::Cell::bytes).sum();
+        if total > budget {
+            let mut ages: Vec<u64> = self.tiles.values().filter(|c| c.used != frame && c.img.is_some()).map(|c| c.used).collect();
+            ages.sort_unstable();
+            if let Some(cut) = ages.get(ages.len() / 2).copied() { self.retire_tiles(|_, c| c.used <= cut && c.used != frame && !c.asked); }
+        }
+        self.tile_levels.clear();
+        for (k, c) in &self.tiles {
+            if c.img.is_none() { continue; }
+            let v = self.tile_levels.entry((k.0, k.1)).or_default();
+            if !v.iter().any(|l| l.to_bits() == k.2) { v.push(f32::from_bits(k.2)); }
+        }
+        let cards: HashSet<(u64, u64)> = self.tiles.keys().map(|k| (k.0, k.1)).collect();
+        self.tile_shown.retain(|k, _| cards.contains(k));
     }
 
     fn handle_ev(&mut self, ev: Ev) {

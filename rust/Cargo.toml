@@ -7,7 +7,7 @@ description = "CodeCanvas: an infinite canvas for code, built on GPUI."
 
 [dependencies]
 gpui = "0.2.2"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 regex = "1"
 ureq = { version = "2", features = ["json"] }

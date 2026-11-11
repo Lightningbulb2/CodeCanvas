@@ -3,6 +3,7 @@
 use crate::agent::ContextItem;
 use crate::diff::{Op, diff_lines};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -136,13 +137,14 @@ pub enum Role { User, Assistant, Note, Error }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ChatMsg {
     pub role: Role,
-    pub content: String,
+    /// Shared, so the up to 60 undo steps (each a copy of the document) don't each copy every chat.
+    pub content: Arc<str>,
     #[serde(default)]
     pub title: Option<String>,
 }
 
 impl ChatMsg {
-    pub fn new(role: Role, content: impl Into<String>) -> Self { Self { role, content: content.into(), title: None } }
+    pub fn new(role: Role, content: impl Into<String>) -> Self { Self { role, content: Arc::from(content.into()), title: None } }
 }
 
 /// A conversation plus a draft: every snippet, file and the global chat has one.

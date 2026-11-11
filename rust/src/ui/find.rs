@@ -252,11 +252,11 @@ impl CanvasView {
         let bad = error.is_some() || (!query_empty && hits.is_empty());
         let toggle = |label: &'static str, on: bool, cx: &mut Context<Self>, f: fn(&mut CanvasView, u64)| {
             div().flex_none().px(px(4. * z)).h(px(18. * z)).flex().items_center().rounded(px(3. * z)).border_1().border_color(if on { col(ACCENT) } else { gpui::transparent_black() }).when(on, |d| d.bg(cola(ACCENT, 0.22)).text_color(col(FG)))
-                .cursor_pointer().hover(|s| s.bg(col(HOVER))).text_size(tpx(10.5 * z)).font_family(mono()).child(label)
+                .cursor_pointer().hover(|s| s.bg(col(HOVER))).text_size(tz(10.5, z)).font_family(mono()).child(label)
                 .on_mouse_down(MouseButton::Left, cx.listener(move |t, _: &MouseDownEvent, _, cx| { cx.stop_propagation(); f(t, id); cx.notify(); }))
         };
         let act = |label: &'static str, cx: &mut Context<Self>, f: fn(&mut CanvasView, u64)| {
-            div().flex_none().px(px(5. * z)).h(px(20. * z)).flex().items_center().rounded(px(3. * z)).cursor_pointer().hover(|s| s.bg(col(HOVER)).text_color(col(FG))).text_size(tpx(11.5 * z)).whitespace_nowrap().child(label)
+            div().flex_none().px(px(5. * z)).h(px(20. * z)).flex().items_center().rounded(px(3. * z)).cursor_pointer().hover(|s| s.bg(col(HOVER)).text_color(col(FG))).text_size(tz(11.5, z)).whitespace_nowrap().child(label)
                 .on_mouse_down(MouseButton::Left, cx.listener(move |t, _: &MouseDownEvent, _, cx| { cx.stop_propagation(); f(t, id); cx.notify(); }))
         };
         let boxed = |focused: bool, bad: bool| div().flex_1().min_w_0().flex().items_center().gap(px(2. * z)).pl(px(6. * z)).pr(px(2. * z)).h(px(24. * z)).bg(col(INPUT)).border_1().border_color(col(if bad { BAD } else if focused { ACCENT } else { BORDER })).rounded(px(3. * z)).overflow_hidden();
@@ -268,7 +268,7 @@ impl CanvasView {
                     .child(toggle("Aa", case, cx, |t, id| { if let Some(f) = t.finds.get_mut(&id) { f.case = !f.case; } }))
                     .child(toggle("ab", word, cx, |t, id| { if let Some(f) = t.finds.get_mut(&id) { f.word = !f.word; } }))
                     .child(toggle(".*", regex, cx, |t, id| { if let Some(f) = t.finds.get_mut(&id) { f.regex = !f.regex; } })))
-                .child(div().flex_none().min_w(px(58. * z)).px(px(3. * z)).text_size(tpx(11. * z)).text_color(col(if bad { BAD } else { MUTED })).whitespace_nowrap().overflow_hidden().max_w(px(150. * z)).child(count))
+                .child(div().flex_none().min_w(px(58. * z)).px(px(3. * z)).text_size(tz(11., z)).text_color(col(if bad { BAD } else { MUTED })).whitespace_nowrap().overflow_hidden().max_w(px(150. * z)).child(count))
                 .child(act("↑", cx, |t, id| t.find_step(id, -1)))
                 .child(act("↓", cx, |t, id| t.find_step(id, 1)))
                 .child(toggle("≡", within, cx, |t, id| t.toggle_within(id)))
@@ -286,7 +286,7 @@ impl CanvasView {
         Some(div().absolute().right(px(14. * z)).top(px(HEAD * z)).w(px(w)).flex().items_start().gap(px(3. * z)).p(px(4. * z)).bg(col(0x252830)).border_1().border_color(col(BORDER)).rounded_b(px(5. * z)).shadow(vec![shadow(4. * z, 14. * z, 0.5)])
             .text_color(col(MUTED)).font_weight(FontWeight::NORMAL).cursor_default()
             .on_any_mouse_down(cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()))
-            .child(div().flex_none().w(px(16. * z)).h(px(24. * z)).flex().items_center().justify_center().rounded(px(3. * z)).cursor_pointer().hover(|s| s.bg(col(HOVER))).text_size(tpx(10. * z)).child(if replace { "▾" } else { "▸" })
+            .child(div().flex_none().w(px(16. * z)).h(px(24. * z)).flex().items_center().justify_center().rounded(px(3. * z)).cursor_pointer().hover(|s| s.bg(col(HOVER))).text_size(tz(10., z)).child(if replace { "▾" } else { "▸" })
                 .on_mouse_down(MouseButton::Left, cx.listener(move |t, _: &MouseDownEvent, _, cx| { cx.stop_propagation(); if let Some(f) = t.finds.get_mut(&id) { f.replace = !f.replace; } cx.notify(); })))
             .child(col_))
     }

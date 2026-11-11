@@ -54,7 +54,27 @@ fn listen(project: u64, tx: Sender<String>) {
     });
 }
 
+/// glibc's allocator settings. By default it raises its "use a separate mapping" threshold whenever a
+/// large block is freed, after which big buffers (text cells, file reads) come from its pools and are
+/// kept after being freed; and it gives every thread its own pool. Both keep memory the app no longer uses.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn tune_allocator() {
+    unsafe extern "C" { fn mallopt(param: i32, value: i32) -> i32; }
+    const M_TRIM_THRESHOLD: i32 = -1;
+    const M_MMAP_THRESHOLD: i32 = -3;
+    const M_ARENA_MAX: i32 = -8;
+    // SAFETY: plain libc calls with documented parameters, made before any other thread exists.
+    unsafe {
+        mallopt(M_MMAP_THRESHOLD, 128 * 1024);
+        mallopt(M_TRIM_THRESHOLD, 1024 * 1024);
+        mallopt(M_ARENA_MAX, 2);
+    }
+}
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn tune_allocator() {}
+
 fn main() {
+    tune_allocator();
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if !argv.iter().any(|a| a == CHILD_FLAG) && relaunch_detached(&argv).is_ok() { return; }
     let args: Vec<PathBuf> = argv.iter().filter(|a| !a.is_empty() && !a.starts_with("--")).map(PathBuf::from).collect();
