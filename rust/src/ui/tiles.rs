@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 /// texture pages. Equal cells reuse those buffers exactly and fill the pages evenly.
 pub(crate) const CELL_W: u32 = 256;
 pub(crate) const CELL_H: u32 = 256;
-const CELL_BYTES: usize = (CELL_W * CELL_H * 4) as usize;
+pub(crate) const CELL_BYTES: usize = (CELL_W * CELL_H * 4) as usize;
 /// New cells handed to the GPU per frame; the rest wait for the next frame.
 pub(crate) const UPLOAD_PER_FRAME: usize = 16;
 /// Zoom steps used while a zoom glides: two per doubling, so a cell is never shrunk by more than 41%

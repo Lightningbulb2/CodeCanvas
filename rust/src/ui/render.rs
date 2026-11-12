@@ -111,6 +111,25 @@ impl AsciiGlyphs {
     }
 }
 
+/// For lines `first..last` (line `i` spans `top + i·lh` to `top + (i+1)·lh` on screen), whether the
+/// rects in `above` together hide the line's whole on-screen width `xs`.
+fn hidden_lines(above: &[[f32; 4]], xs: (f32, f32), top: f32, lh: f32, first: usize, last: usize) -> Vec<bool> {
+    let mut out = vec![false; last.saturating_sub(first)];
+    if above.is_empty() || xs.1 <= xs.0 { return out; }
+    let mut spans: Vec<(f32, f32)> = Vec::new();
+    for (j, i) in (first..last).enumerate() {
+        let (y0, y1) = (top + i as f32 * lh, top + (i + 1) as f32 * lh);
+        spans.clear();
+        spans.extend(above.iter().filter(|r| r[1] <= y0 && r[3] >= y1 && r[2] > xs.0 && r[0] < xs.1).map(|r| (r[0], r[2])));
+        if spans.is_empty() { continue; }
+        spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut reach = xs.0;
+        for &(a, b) in &spans { if a > reach { break; } reach = reach.max(b); }
+        out[j] = reach >= xs.1;
+    }
+    out
+}
+
 /// Paints an ASCII line (tabs already expanded) glyph by glyph in columns `cw` apart.
 #[allow(clippy::too_many_arguments)]
 fn paint_mono(text: &str, hl: &[(Range<usize>, HighlightStyle)], plain: Hsla, alpha: f32, origin: gpui::Point<Pixels>, line_height: Pixels, glyph_px: f32, pos_px: f32, cw: f32,
@@ -180,7 +199,7 @@ impl CanvasView {
         self.anim.get(&(file, i)).copied().unwrap_or(target) + self.fx.shift(file, i)
     }
 
-    fn lines_el(&mut self, card: &Card, pane: u64, sx: f32, sy: f32, vw: f32, vh: f32, opaque: bool, cx: &mut Context<Self>) -> Div {
+    fn lines_el(&mut self, card: &Card, pane: u64, sx: f32, sy: f32, vw: f32, vh: f32, opaque: bool, above: &[[f32; 4]], cx: &mut Context<Self>) -> Div {
         let z = self.pv(pane).v.z;
         let id = card.id;
         let editing = self.editing == Some(id);
@@ -207,6 +226,8 @@ impl CanvasView {
             (a..b, ((-tsx / t.z).max(0.), ((vw - tsx) / t.z).min(card.w)))
         };
         let last = ((((vh - top_px) / lh).ceil().max(0.) as usize) + 6).min(lines.len());
+        // Lines that opaque cards drawn above this one hide completely are neither drawn nor cached.
+        let hidden = hidden_lines(above, (sx.max(0.), (sx + card.w * z).min(vw)), top_px + PAD * z, lh, first, last);
         let mut layer = div().absolute().left_0().top(px(HEAD * z)).w_full().bottom_0().overflow_hidden()
             .when(card.is_file() || editing, |d| d.cursor_text())
             .on_mouse_down(MouseButton::Left, cx.listener(move |t, e: &MouseDownEvent, _, cx| {
@@ -226,14 +247,14 @@ impl CanvasView {
         // edited, dragged into or out of, or running a line effect is drawn directly instead.
         let plain = !editing && !opaque && !self.fx.lines.iter().any(|l| l.file == id)
             && !live.as_ref().is_some_and(|l| l.over == Some(id) || (l.src.is_some_and(|s| s.0 == id) && !l.ref_mode));
-        let (tiled, tile_draws) = if plain && last > first { self.cells_for(pane, card, &spans, start_no, first, last, x_range, ahead, z) } else { (Vec::new(), Vec::new()) };
+        let (tiled, tile_draws) = if plain && last > first { self.cells_for(pane, card, &spans, start_no, first, last, x_range, ahead, z, &hidden) } else { (Vec::new(), Vec::new()) };
         let mut rows: Vec<Row> = Vec::with_capacity(last.saturating_sub(first));
         let (hits, hit_cur) = (self.find_hits(id), self.finds.get(&id).map_or(usize::MAX, |f| f.cur));
         let mut hit = hits.partition_point(|h| h.line < first);
         let cw = self.char_w(z);
         for i in first..last {
             let lifted = live.as_ref().is_some_and(|l| l.src.is_some_and(|s| s.0 == id && !l.ref_mode && i >= s.1 && i <= s.2));
-            if lifted { continue; }
+            if lifted || (hidden[i - first] && live.is_none()) { continue; }
             let (target, shift) = live.as_ref().map_or((0., 0), |l| self.live_offset(id, i, l));
             let off = self.eased((id, i), target, dragging) + self.fx.shift(id, i);
             let alpha = self.fx.alpha(id, i);
@@ -268,6 +289,9 @@ impl CanvasView {
         let (num_right, caret_w) = (gutter - 12. * z, (1.5 * z).max(1.));
         let glyphs = self.ascii_glyphs.clone();
         layer = layer.child(canvas(|_, _, _| (), move |b: Bounds<Pixels>, _, window, _| {
+            // One GPUI layer for the card's text: everything inside shares a single draw order, so the
+            // scene does not search its bounds tree once per glyph (which is slow where cards overlap).
+            window.paint_layer(b, |window| {
             let base = font(mono());
             let italic = base.clone().italic();
             let ts = window.text_system().clone();
@@ -304,6 +328,7 @@ impl CanvasView {
                 let clip = gpui::ContentMask { bounds: Bounds::new(point(b.origin.x, px(c0)), size(b.size.width, px(c1 - c0))) };
                 window.with_content_mask(Some(clip), |window| { let _ = window.paint_image(Bounds::new(point(px(x0), px(y0)), size(px(x1 - x0), px(y1 - y0))), gpui::Corners::default(), img, 0, false); });
             }
+            });
         }).absolute().size_full());
         self.live = live;
         layer
@@ -316,7 +341,7 @@ impl CanvasView {
     /// ready, clipped to those lines, so levels never overlap; missing cells are asked of the worker
     /// threads, those for lines nothing covers yet first. Lines no level covers are drawn directly.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-    fn cells_for(&mut self, pane: u64, card: &Card, spans: &Rc<Spans>, start_no: usize, first: usize, last: usize, x_range: (f32, f32), ahead: (Range<usize>, (f32, f32)), z: f32) -> (Vec<bool>, Vec<(Arc<gpui::RenderImage>, f32, f32, f32, f32, f32, f32)>) {
+    fn cells_for(&mut self, pane: u64, card: &Card, spans: &Rc<Spans>, start_no: usize, first: usize, last: usize, x_range: (f32, f32), ahead: (Range<usize>, (f32, f32)), z: f32, hidden: &[bool]) -> (Vec<bool>, Vec<(Arc<gpui::RenderImage>, f32, f32, f32, f32, f32, f32)>) {
         let (id, sf) = (card.id, self.scale);
         let raw = self.views.get(&pane).copied().unwrap_or(self.views[&self.active]);
         // While gliding, ask for the zoom step the glide will reach in about two frames; at rest, the exact zoom.
@@ -355,18 +380,20 @@ impl CanvasView {
         // each line's level (index into `levels`), or none
         let mut pick: Vec<Option<usize>> = Vec::with_capacity(last - first);
         for i in first..last {
-            pick.push(levels.iter().position(|&l| rows_of(l, i).all(|cy| ready(self, l, cy))));
+            pick.push(if hidden[i - first] { None } else { levels.iter().position(|&l| rows_of(l, i).all(|cy| ready(self, l, cy))) });
         }
         // Ask for missing cells at `want`: first rows of lines nothing covers, then rows that will come
         // into view where the view is heading, then the rest. (priority, row, columns)
         let mut rows: Vec<(u8, u32, std::ops::RangeInclusive<u32>)> = Vec::new();
         for (j, i) in (first..last).enumerate() {
+            if hidden[j] { continue; }
             let p = if pick[j].is_none() { 0 } else { 2 };
             for cy in rows_of(want, i) { match rows.last_mut() { Some(r) if r.1 == cy => r.0 = r.0.min(p), _ => rows.push((p, cy, cols_at(want))) } }
         }
         let (ahead_lines, ahead_x) = ahead;
         let wide = { let (a, b) = (span_cols(want, ahead_x), cols_at(want)); (*a.start()).min(*b.start())..=(*a.end()).max(*b.end()) };
         for i in ahead_lines {
+            if i >= first && i < last && hidden[i - first] { continue; }
             for cy in rows_of(want, i) {
                 match rows.iter_mut().find(|r| r.1 == cy) { Some(r) => r.2 = wide.clone(), None => rows.push((1, cy, wide.clone())) }
             }
@@ -405,7 +432,7 @@ impl CanvasView {
             } }
             j = e + 1;
         }
-        let complete = pick.iter().all(|p| *p == Some(0));
+        let complete = pick.iter().zip(hidden).all(|(p, h)| *h || *p == Some(0));
         if complete { self.tile_shown.insert((pane, id), want); }
         if !complete || self.tile_pool.in_flight > 0 { self.fx.want_frame = true; }
         (pick.iter().map(Option::is_some).collect(), draws)
@@ -536,6 +563,18 @@ impl CanvasView {
         let moving: Vec<u64> = match &self.drag { Some(Drag::Move { items, moved: true, .. }) => items.iter().map(|i| i.id).collect(), _ => Vec::new() };
         let mut out: Vec<AnyElement> = Vec::new();
         let mut drawers: Vec<AnyElement> = Vec::new(); // tabs and chats always sit above every card
+        // Where each card fully hides what is beneath it, in screen pixels: cards are opaque, drawn in
+        // list order, so a card's text is hidden by the rects of the cards after it. Only cards resting
+        // in place count, shrunk by their rounded corners.
+        let cover: Vec<Option<[f32; 4]>> = if z < FAR_Z { Vec::new() } else { self.doc.cards.iter().map(|c| {
+            if !self.in_pane(c, pane) || self.fx.slides.contains_key(&c.id) || self.editing == Some(c.id) || ghost_card == Some(c.id) { return None; }
+            if self.fx.card(c.id) != (1., 0.) || self.fx.extra(c.id) != 0. || self.fx.slide(c.id) != (0., 0.) { return None; }
+            if self.live.as_ref().is_some_and(|l| l.over == Some(c.id) || l.src.is_some_and(|s| s.0 == c.id)) { return None; }
+            let (x, y) = ((c.x * z + v.x).round(), (c.y * z + v.y).round());
+            let h = (HEAD + PAD * 2. + c.lines.len().max(1) as f32 * LH) * z;
+            let r = 10. * z;
+            Some([x + r, y + r, x + c.w * z - r, y + h - r])
+        }).collect() };
         for i in 0..self.doc.cards.len() {
             // Decide from the card's frame whether it is on screen before copying any of its text.
             let src = &self.doc.cards[i];
@@ -579,7 +618,8 @@ impl CanvasView {
             }
             let id = c.id;
             let docking = over == Some(id) && live_pane_ok;
-            let lines = self.lines_el(c, pane, sx, sy, vw, vh, docking, cx);
+            let above: Vec<[f32; 4]> = cover.iter().skip(i + 1).flatten().filter(|r| r[2] > r[0] && r[3] > r[1]).copied().collect();
+            let lines = self.lines_el(c, pane, sx, sy, vw, vh, docking, &above, cx);
             let regions = self.regions_el(c, pane, cx);
             let header = self.header_el(c, pane, z, cx);
             let resize = div().absolute().right_0().bottom_0().size(px(14. * z)).cursor_nwse_resize()

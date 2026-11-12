@@ -1609,11 +1609,15 @@ impl CanvasView {
         if !self.tile_inbox.is_empty() || self.tile_pool.in_flight > 0 { self.fx.want_frame = true; }
         let frame = self.frame;
         self.retire_tiles(|_, c| frame.saturating_sub(c.used) > 20 && !c.asked);
-        let total: usize = self.tiles.values().map(tiles::Cell::bytes).sum();
+        // Over budget: the least recently used cells go first, never one drawn in the last two frames
+        // (dropping cells still on screen would put their text back to direct drawing and redo them).
+        let mut total: usize = self.tiles.values().map(tiles::Cell::bytes).sum();
         if total > budget {
-            let mut ages: Vec<u64> = self.tiles.values().filter(|c| c.used != frame && c.img.is_some()).map(|c| c.used).collect();
-            ages.sort_unstable();
-            if let Some(cut) = ages.get(ages.len() / 2).copied() { self.retire_tiles(|_, c| c.used <= cut && c.used != frame && !c.asked); }
+            let mut old: Vec<(u64, tiles::Key)> = self.tiles.iter().filter(|(_, c)| c.img.is_some() && !c.asked && frame.saturating_sub(c.used) > 2).map(|(k, c)| (c.used, *k)).collect();
+            old.sort_unstable_by_key(|o| o.0);
+            let mut gone = HashSet::new();
+            for (_, k) in old { if total <= budget { break; } total -= tiles::CELL_BYTES; gone.insert(k); }
+            if !gone.is_empty() { self.retire_tiles(|k, _| gone.contains(k)); }
         }
         self.tile_levels.clear();
         for (k, c) in &self.tiles {
