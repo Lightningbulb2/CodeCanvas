@@ -105,9 +105,10 @@ impl AsciiGlyphs {
             line.runs.first().and_then(|r| r.glyphs.first().map(|g| (r.font_id, g.id)))
         })
     }
-    /// (ascent, descent) of the code font at [`SHAPE_PX`].
+    /// (ascent, descent) of the code font at [`SHAPE_PX`], both as distances from the baseline (the
+    /// platform reports the descent as a negative number).
     fn metrics(&mut self, ts: &gpui::WindowTextSystem, base: &Font) -> (f32, f32) {
-        *self.metrics.get_or_insert_with(|| { let id = ts.resolve_font(base); (fl(ts.ascent(id, px(SHAPE_PX))), fl(ts.descent(id, px(SHAPE_PX)))) })
+        *self.metrics.get_or_insert_with(|| { let id = ts.resolve_font(base); (fl(ts.ascent(id, px(SHAPE_PX))), fl(ts.descent(id, px(SHAPE_PX))).abs()) })
     }
 }
 
@@ -247,7 +248,11 @@ impl CanvasView {
         // edited, dragged into or out of, or running a line effect is drawn directly instead.
         let plain = !editing && !opaque && !self.fx.lines.iter().any(|l| l.file == id)
             && !live.as_ref().is_some_and(|l| l.over == Some(id) || (l.src.is_some_and(|s| s.0 == id) && !l.ref_mode));
-        let (tiled, tile_draws) = if plain && last > first { self.cells_for(pane, card, &spans, start_no, first, last, x_range, ahead, z, &hidden) } else { (Vec::new(), Vec::new()) };
+        let (mut tiled, mut tile_draws) = if plain && last > first { self.cells_for(pane, card, &spans, start_no, first, last, x_range, ahead, z, &hidden) } else { (Vec::new(), Vec::new()) };
+        // While the zoom is moving the text is drawn as real glyphs at each frame's size, as a browser
+        // does: a stretched cell loses contrast and looks dim. The cells for the zoom being landed on
+        // are still asked for above, so they are in place when it stops.
+        if self.views.get(&pane).is_some_and(|p| (p.t.z - p.v.z).abs() > 1e-4) { tiled.clear(); tile_draws.clear(); }
         let mut rows: Vec<Row> = Vec::with_capacity(last.saturating_sub(first));
         let (hits, hit_cur) = (self.find_hits(id), self.finds.get(&id).map_or(usize::MAX, |f| f.cur));
         let mut hit = hits.partition_point(|h| h.line < first);
@@ -347,11 +352,18 @@ impl CanvasView {
     fn cells_for(&mut self, pane: u64, card: &Card, spans: &Rc<Spans>, start_no: usize, first: usize, last: usize, x_range: (f32, f32), ahead: (Range<usize>, (f32, f32)), z: f32, hidden: &[bool]) -> (Vec<bool>, Vec<(Arc<gpui::RenderImage>, f32, f32, f32, f32, f32, f32)>) {
         let (id, sf) = (card.id, self.scale);
         let raw = self.views.get(&pane).copied().unwrap_or(self.views[&self.active]);
-        // While a zoom glides, ask for cells at the zoom it will land on: they are ready when it arrives, so
-        // the text is sharp at once with no swap, and on the way they are only scaled by what is left of
-        // the glide (a wheel notch is 10%).
+        // While a zoom glides, ask for cells at the zoom it will land on, so they are ready when it arrives
+        // (the caller draws real glyphs until then).
         let gliding = (raw.t.z - raw.v.z).abs() > 1e-4;
         let want = if gliding { raw.t.z } else { z };
+        if gliding {
+            // Nothing is drawn from cells mid-zoom, and while the wheel is still turning the target keeps
+            // changing: cells are only worth drawing once it has held for a few frames. The glide takes
+            // longer than that to settle, so they are still there when it lands.
+            let aim = self.zoom_aim.entry(pane).or_insert((0, 0));
+            if aim.0 != want.to_bits() { *aim = (want.to_bits(), self.frame); }
+            if self.frame - aim.1 < 4 { return (Vec::new(), Vec::new()); }
+        }
         let n = card.lines.len();
         let (gutter, cw) = (self.gutter(n), self.char_w(1.));
         let (ch, cwd) = (tiles::CELL_H as f32, tiles::CELL_W as f32);

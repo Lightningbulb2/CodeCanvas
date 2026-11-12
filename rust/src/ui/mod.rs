@@ -214,6 +214,9 @@ pub struct CanvasView {
     pub(crate) tiles: HashMap<tiles::Key, tiles::Cell>,
     /// The zoom each card (per view) was last drawn completely from.
     pub(crate) tile_shown: HashMap<(u64, u64), f32>,
+    /// Per view: the zoom it is gliding to and the frame that target was set, to tell a wheel still
+    /// turning from one that has stopped.
+    pub(crate) zoom_aim: HashMap<u64, (u32, u64)>,
     /// The zoom levels each card (per view) has drawn cells at, rebuilt every frame.
     pub(crate) tile_levels: HashMap<(u64, u64), Vec<f32>>,
     pub(crate) tile_pool: tiles::Pool,
@@ -349,7 +352,7 @@ impl CanvasView {
             drag: None, live: None, selected: HashSet::new(), picked: None, hover_tab: None, doomed: Vec::new(), undo: Vec::new(), redo: Vec::new(),
             inputs: HashMap::new(), focus_input: None, editing: None, busy: HashMap::new(), tx, rx, explaining: HashMap::new(), explain_queue: None, menu: None, pick: None,
             models: None, show_settings: false, show_help: false, expanded: HashSet::new(), chat_open: true, explorer_open: true, hist_open: true, spans: HashMap::new(), scrolls: HashMap::new(),
-            pending_bottom: HashSet::new(), chat_lists: HashMap::new(), chat_view: { let canvas = cx.weak_entity(); gpui::AppContext::new(cx, |_| ChatPanelView { canvas }) }, chat_key: 0, ui_font, chrome: [Part::Top, Part::Explorer, Part::Context].into_iter().map(|part| { let canvas = cx.weak_entity(); (part, gpui::AppContext::new(cx, |_| ChromeView { canvas, part }), 0) }).collect(), space: false, toasts: Vec::new(), char_ratio, anim: HashMap::new(), fx: Fx::default(), finds: HashMap::new(), tiles: HashMap::new(), tile_shown: HashMap::new(), tile_levels: HashMap::new(), tile_pool: tiles::Pool::new(mono()), tile_inbox: Default::default(), frame: 0, scale: 1., dead_tiles: Vec::new(), dot_tiles: Vec::new(), ascii_glyphs: Default::default(), side: (EXPLORER_W, CHAT_W), sel_at: Instant::now(), started: Instant::now(), focus, win_size: (1500., 950.), mouse: (0., 0.), mods: Default::default(),
+            pending_bottom: HashSet::new(), chat_lists: HashMap::new(), chat_view: { let canvas = cx.weak_entity(); gpui::AppContext::new(cx, |_| ChatPanelView { canvas }) }, chat_key: 0, ui_font, chrome: [Part::Top, Part::Explorer, Part::Context].into_iter().map(|part| { let canvas = cx.weak_entity(); (part, gpui::AppContext::new(cx, |_| ChromeView { canvas, part }), 0) }).collect(), space: false, toasts: Vec::new(), char_ratio, anim: HashMap::new(), fx: Fx::default(), finds: HashMap::new(), tiles: HashMap::new(), tile_shown: HashMap::new(), zoom_aim: HashMap::new(), tile_levels: HashMap::new(), tile_pool: tiles::Pool::new(mono()), tile_inbox: Default::default(), frame: 0, scale: 1., dead_tiles: Vec::new(), dot_tiles: Vec::new(), ascii_glyphs: Default::default(), side: (EXPLORER_W, CHAT_W), sel_at: Instant::now(), started: Instant::now(), focus, win_size: (1500., 950.), mouse: (0., 0.), mods: Default::default(),
             state_dirty: None, mtimes: HashMap::new(), last_poll: Instant::now(), inbox, saver, doc_dirty: true,
         };
         if let Some(s) = this.project.load_state() {

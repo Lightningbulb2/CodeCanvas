@@ -129,6 +129,24 @@ struct Raster {
     regular: fontdb::ID,
     italic: fontdb::ID,
     glyphs: HashMap<CacheKey, Option<Glyph>>,
+    /// Per text colour: glyph coverage to the alpha GPUI would draw it with (see [`glyph_alpha`]).
+    tone: HashMap<[u8; 3], [u8; 256]>,
+}
+
+/// The contrast and gamma correction GPUI's renderer applies to glyph coverage (its defaults: gamma
+/// 1.8, enhanced contrast 1), so text in a cell has exactly the weight of text GPUI draws itself.
+fn glyph_alpha(color: [u8; 3]) -> [u8; 256] {
+    const G: [f32; 4] = [0.1469 / 4. * (65536. / 65025. * 4.), -0.8911 / 4. * (256. / 255. * 4.), 1.4644 / 4. * (65536. / 65025. * 4.), -0.3234 / 4. * (256. / 255. * 4.)];
+    let b = (0.30 * color[0] as f32 + 0.59 * color[1] as f32 + 0.11 * color[2] as f32) / 255.;
+    let k = (4. * (0.75 - b)).clamp(0., 1.);
+    let mut out = [0u8; 256];
+    for (i, o) in out.iter_mut().enumerate() {
+        let a = i as f32 / 255.;
+        let a = a * (k + 1.) / (a * k + 1.);
+        let a = a + a * (1. - a) * ((G[0] * b + G[1]) * a + (G[2] * b + G[3]));
+        *o = (a.clamp(0., 1.) * 255.).round() as u8;
+    }
+    out
 }
 
 fn rgb(c: u32) -> [u8; 3] { [(c >> 16) as u8, (c >> 8) as u8, c as u8] }
@@ -153,7 +171,7 @@ impl Raster {
             loaded.iter().copied().find(|id| db.face(*id).is_some_and(|f| f.index == *index)).or(loaded.first().copied())
         }).collect::<Option<_>>()?;
         let fonts = FontSystem::new_with_locale_and_db("en-US".into(), db);
-        Some(Self { fonts, swash: SwashCache::new(), regular: ids[0], italic: ids[1], glyphs: HashMap::new() })
+        Some(Self { fonts, swash: SwashCache::new(), regular: ids[0], italic: ids[1], glyphs: HashMap::new(), tone: HashMap::new() })
     }
 
     fn run(&mut self, job: Job) -> Done {
@@ -166,10 +184,12 @@ impl Raster {
         if self.glyphs.len() > 6000 { self.glyphs.clear(); }
         let (regular, italic) = (self.fonts.get_font(self.regular)?, self.fonts.get_font(self.italic)?);
         let k = job.z * job.scale;
-        let (lh, cw, gutter, num_right, font_px) = (job.lh * k, job.cw * k, job.gutter * k, job.num_right * k, 12.5 * k);
+        // glyphs at the quarter-pixel size and quarter-pixel offsets GPUI uses for directly drawn text, so
+        // a line looks the same whichever way it is drawn; line metrics from the exact size
+        let (lh, cw, gutter, num_right, font_px) = (job.lh * k, job.cw * k, job.gutter * k, job.num_right * k, ((12.5 * job.z * 4.).round() / 4.).max(0.25) * job.scale);
         let (x0, y0) = ((job.key.3 * CELL_W) as f32, (job.key.4 * CELL_H) as f32);
         let (w, h) = (CELL_W as usize, CELL_H as usize);
-        let m = regular.as_swash().metrics(&[]).scale(font_px);
+        let m = regular.as_swash().metrics(&[]).scale(12.5 * k);
         let mut px = vec![0u8; w * h * 4];
         let (fg, num, num_alpha) = (rgb(0xd6d9de), rgb(0x8a9099), 0.7f32);
         for i in job.range.clone() {
@@ -209,13 +229,14 @@ impl Raster {
 
     #[allow(clippy::too_many_arguments)]
     fn blit(&mut self, px: &mut [u8], w: usize, h: usize, font: fontdb::ID, gid: u16, size: f32, x: f32, baseline: i32, color: [u8; 3], strength: f32) {
-        let (key, xi, _) = CacheKey::new(font, gid, size, (x, 0.), CacheKeyFlags::empty());
+        let (key, xi, _) = CacheKey::new(font, gid, size, ((x * 4.).floor() / 4. + 0.01, 0.), CacheKeyFlags::empty());
         if !self.glyphs.contains_key(&key) {
             let g = self.swash.get_image_uncached(&mut self.fonts, key).filter(|i| matches!(i.content, cosmic_text::SwashContent::Mask) && i.placement.width > 0 && i.placement.height > 0)
                 .map(|i| Glyph { left: i.placement.left, top: i.placement.top, w: i.placement.width as usize, h: i.placement.height as usize, alpha: i.data });
             self.glyphs.insert(key, g);
         }
         let Some(Some(g)) = self.glyphs.get(&key) else { return };
+        let tone = self.tone.entry(color).or_insert_with(|| glyph_alpha(color));
         let (x0, y0) = (xi + g.left, baseline - g.top);
         // One pixel around the glyph also takes its colour (at zero alpha), so a scaled tile doesn't
         // blend the text toward black at its edges.
@@ -226,7 +247,7 @@ impl Raster {
                 let xx = x0 + gx;
                 if xx < 0 || xx >= w as i32 { continue; }
                 let inside = gy >= 0 && gx >= 0 && (gy as usize) < g.h && (gx as usize) < g.w;
-                let a = if inside { (g.alpha[gy as usize * g.w + gx as usize] as f32 * strength) as u8 } else { 0 };
+                let a = if inside { (tone[g.alpha[gy as usize * g.w + gx as usize] as usize] as f32 * strength) as u8 } else { 0 };
                 let p = &mut px[(y as usize * w + xx as usize) * 4..][..4];
                 if a > p[3] || p[3] == 0 { p[0] = color[2]; p[1] = color[1]; p[2] = color[0]; }
                 if a > p[3] { p[3] = a; }
