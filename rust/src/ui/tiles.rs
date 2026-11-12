@@ -28,16 +28,9 @@ pub(crate) const CELL_W: u32 = 256;
 pub(crate) const CELL_H: u32 = 256;
 pub(crate) const CELL_BYTES: usize = (CELL_W * CELL_H * 4) as usize;
 /// New cells handed to the GPU per frame; the rest wait for the next frame.
-pub(crate) const UPLOAD_PER_FRAME: usize = 16;
-/// Zoom steps used while a zoom glides: two per doubling, so a cell is never shrunk by more than 41%
-/// while gliding (still sharp), and a glide only renders a few sets of cells on the way.
-const STEPS: f32 = 2.;
-
+pub(crate) const UPLOAD_PER_FRAME: usize = 32;
 /// (view, card, zoom bits, column, row).
 pub(crate) type Key = (u64, u64, u32, u32, u32);
-
-/// The smallest zoom step at or above `z`.
-pub(crate) fn step_up(z: f32) -> f32 { 2f32.powf((z.log2() * STEPS - 1e-3).ceil() / STEPS) }
 
 /// One cell, or the promise of one while a worker draws it.
 pub(crate) struct Cell {
@@ -124,7 +117,7 @@ impl Pool {
 
     /// Jobs allowed in flight at once: enough to keep every worker busy, few enough that what they draw
     /// is still wanted when it arrives.
-    pub fn room(&self) -> bool { self.in_flight < self.threads * 6 }
+    pub fn room(&self) -> bool { self.in_flight < self.threads * 12 }
 }
 
 struct Glyph { left: i32, top: i32, w: usize, h: usize, alpha: Vec<u8> }

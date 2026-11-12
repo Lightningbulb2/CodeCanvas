@@ -321,7 +321,10 @@ impl CanvasView {
                 // Edges on whole device pixels: neighbouring cells meet without seams, and a cell drawn
                 // at its own zoom maps pixel for pixel, as sharp as direct text. Each is clipped to the
                 // lines it was picked for.
-                let d = |v: f32| (v * sf).round() / sf;
+                // A cell being scaled (mid-zoom) keeps its exact place instead: rounding each cell's
+                // edges on its own would make neighbours stretch and shift against each other.
+                let exact = (h * sf - tiles::CELL_H as f32).abs() < 0.01;
+                let d = |v: f32| if exact { (v * sf).round() / sf } else { v };
                 let (x0, y0) = (d(fl(b.origin.x) + x), d(fl(b.origin.y) + y));
                 let (x1, y1) = (d(fl(b.origin.x) + x + w), d(fl(b.origin.y) + y + h));
                 let (c0, c1) = (d(fl(b.origin.y) + top), d(fl(b.origin.y) + bottom));
@@ -344,9 +347,11 @@ impl CanvasView {
     fn cells_for(&mut self, pane: u64, card: &Card, spans: &Rc<Spans>, start_no: usize, first: usize, last: usize, x_range: (f32, f32), ahead: (Range<usize>, (f32, f32)), z: f32, hidden: &[bool]) -> (Vec<bool>, Vec<(Arc<gpui::RenderImage>, f32, f32, f32, f32, f32, f32)>) {
         let (id, sf) = (card.id, self.scale);
         let raw = self.views.get(&pane).copied().unwrap_or(self.views[&self.active]);
-        // While gliding, ask for the zoom step the glide will reach in about two frames; at rest, the exact zoom.
+        // While a zoom glides, ask for cells at the zoom it will land on: they are ready when it arrives, so
+        // the text is sharp at once with no swap, and on the way they are only scaled by what is left of
+        // the glide (a wheel notch is 10%).
         let gliding = (raw.t.z - raw.v.z).abs() > 1e-4;
-        let want = if gliding { tiles::step_up(z * (raw.t.z / z).powf(0.4)) } else { z };
+        let want = if gliding { raw.t.z } else { z };
         let n = card.lines.len();
         let (gutter, cw) = (self.gutter(n), self.char_w(1.));
         let (ch, cwd) = (tiles::CELL_H as f32, tiles::CELL_W as f32);
@@ -387,6 +392,9 @@ impl CanvasView {
         let mut rows: Vec<(u8, u32, std::ops::RangeInclusive<u32>)> = Vec::new();
         for (j, i) in (first..last).enumerate() {
             if hidden[j] { continue; }
+            // zooming far in: most of what shows now will be off screen on arrival, so only what
+            // nothing covers is asked for here; the rows the view is heading for follow below
+            if pick[j].is_some() && want > z * 1.25 { continue; }
             let p = if pick[j].is_none() { 0 } else { 2 };
             for cy in rows_of(want, i) { match rows.last_mut() { Some(r) if r.1 == cy => r.0 = r.0.min(p), _ => rows.push((p, cy, cols_at(want))) } }
         }
@@ -400,11 +408,12 @@ impl CanvasView {
         }
         rows.sort_by_key(|r| r.0);
         rows.truncate(64);
-        'ask: for (_, cy, cols) in rows {
+        for (_, cy, cols) in rows {
             for cx in cols {
                 let key = (pane, id, want.to_bits(), cx, cy);
+                // every cell still wanted is marked as such, including those already being drawn
                 if let Some(c) = self.tiles.get_mut(&key) { if content_ok(c) { c.used = self.frame; continue; } }
-                if !self.tile_pool.room() { self.fx.want_frame = true; break 'ask; }
+                if !self.tile_pool.room() { self.fx.want_frame = true; continue; }
                 if let Some(old) = self.tiles.remove(&key) { self.dead_tiles.extend(old.img); }
                 let k = want * sf;
                 let a = (((cy * tiles::CELL_H) as f32 / (LH * k)).floor() as usize).saturating_sub(1).min(n);

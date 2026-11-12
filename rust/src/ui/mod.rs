@@ -550,7 +550,7 @@ impl CanvasView {
             let (t, a) = (p.t, p.anchor);
             let v = &mut p.v;
             if (t.z - v.z).abs() > 1e-4 {
-                let nz = if (t.z / v.z - 1.).abs() < 0.002 { t.z } else { v.z * (t.z / v.z).powf(kz) };
+                let nz = if (t.z / v.z - 1.).abs() < 0.005 { t.z } else { v.z * (t.z / v.z).powf(kz) };
                 let r = nz / v.z;
                 v.x = a.0 - (a.0 - v.x) * r; v.y = a.1 - (a.1 - v.y) * r; v.z = nz;
                 moved = true;
@@ -1597,6 +1597,15 @@ impl CanvasView {
         let budget = ((self.win_size.0 * self.win_size.1 * self.scale * self.scale * 4. * 4.) as usize).max(16 << 20);
         let finished = self.tile_pool.finished();
         self.tile_inbox.extend(finished);
+        // Cells nobody has asked for in the last few frames (the zoom moved on while they were being
+        // drawn) are dropped unseen, so the ones wanted now are not kept waiting behind them.
+        let frame = self.frame;
+        let tiles = &mut self.tiles;
+        self.tile_inbox.retain(|d| {
+            let stale = tiles.get(&d.key).is_some_and(|c| c.asked && frame.saturating_sub(c.used) > 4);
+            if stale { tiles.remove(&d.key); }
+            !stale
+        });
         let mut taken = 0;
         while taken < tiles::UPLOAD_PER_FRAME {
             let Some(d) = self.tile_inbox.pop_front() else { break };
@@ -1607,7 +1616,6 @@ impl CanvasView {
             match d.img { Some(img) => { c.img = Some(img); taken += 1; } None => c.missing = true }
         }
         if !self.tile_inbox.is_empty() || self.tile_pool.in_flight > 0 { self.fx.want_frame = true; }
-        let frame = self.frame;
         self.retire_tiles(|_, c| frame.saturating_sub(c.used) > 20 && !c.asked);
         // Over budget: the least recently used cells go first, never one drawn in the last two frames
         // (dropping cells still on screen would put their text back to direct drawing and redo them).
