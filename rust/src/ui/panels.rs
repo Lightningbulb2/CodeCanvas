@@ -403,7 +403,19 @@ impl CanvasView {
             body = body.bg(col(INPUT)).child(div().px(px(10. * z)).py(px(6. * z)).child(self.input_el(Input::DraftEdit(owner), "", 12. * z, cx)));
         } else {
             if add + del == 0 { body = body.child(div().font_family(self.ui_font).px(px(10. * z)).py(px(6. * z)).text_color(col(MUTED)).child("No changes yet. Click Edit, or ask the LLM below; suggested changes show up here as a diff you can Apply.")); }
-            for op in ops {
+            // long unchanged stretches fold away, keeping three lines around each change
+            let keep: Vec<bool> = {
+                let changed: Vec<bool> = ops.iter().map(|o| !matches!(o, Op::Same(..))).collect();
+                let n = changed.len();
+                (0..n).map(|i| (i.saturating_sub(3)..(i + 4).min(n)).any(|j| changed[j])).collect()
+            };
+            let mut skipped = 0;
+            for (k, op) in ops.into_iter().enumerate() {
+                if add + del > 0 && !keep[k] { skipped += 1; continue; }
+                if skipped > 0 {
+                    body = body.child(div().pl(px(74. * z)).text_color(cola(MUTED, 0.8)).bg(cola(MUTED, 0.06)).font_family(self.ui_font).text_size(tz(11., z)).child(format!("⋯ {skipped} unchanged line{}", if skipped == 1 { "" } else { "s" })));
+                    skipped = 0;
+                }
                 let (mark, tint, an, bn, line, spans) = match op {
                     Op::Same(a, b) => (" ", None, Some(a), Some(b), base[a].clone(), hb.line(a)),
                     Op::Del(a) => ("−", Some(BAD), Some(a), None, base[a].clone(), hb.line(a)),
@@ -416,6 +428,7 @@ impl CanvasView {
                     .child(div().w(px(14. * z)).flex_none().text_color(col(tint.unwrap_or(MUTED))).child(mark))
                     .child(div().flex_1().overflow_hidden().when(gone, |d| d.opacity(0.8).line_through()).child(StyledText::new(text).with_highlights(hl))));
             }
+            if skipped > 0 { body = body.child(div().pl(px(74. * z)).text_color(cola(MUTED, 0.8)).bg(cola(MUTED, 0.06)).font_family(self.ui_font).text_size(tz(11., z)).child(format!("⋯ {skipped} unchanged line{}", if skipped == 1 { "" } else { "s" }))); }
         }
         let focused = self.focus_input == Some(Input::Ask(id));
         let ask = self.input_el(Input::Ask(id), "Ask the LLM for a change… (Enter)", 12. * z, cx);
@@ -508,6 +521,7 @@ impl CanvasView {
         if c.is_file() {
             let path = c.path.clone().unwrap();
             let base = basename(&path).to_string();
+            list.push(((if c.talk.draft_open { "Hide draft" } else { "Draft changes to this file" }).into(), Some(Rc::new(move |t, _, _| t.toggle_draft(id)))));
             if !snips.is_empty() {
                 let s2 = snips.clone();
                 list.push((format!("{} snippet(s) → {base}", snips.len()), None));

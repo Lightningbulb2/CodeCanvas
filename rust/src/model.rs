@@ -226,6 +226,9 @@ pub struct Card {
     pub target: Option<Target>,
     #[serde(skip)]
     pub sel: Option<(usize, usize)>,
+    /// Lines wider than the card stick out of its right side in full (they always do while editing).
+    #[serde(default)]
+    pub wide: bool,
 }
 
 impl Card {
@@ -448,7 +451,7 @@ impl Doc {
     fn new_floating(&mut self, title: String, lines: Vec<String>, lang: String, x: f32, y: f32, w: f32, pane: u64) -> Card {
         let color = self.fresh_color();
         let id = self.fresh_id();
-        Card { id, path: None, title, lang, pane, x, y, w, lines: Lines::new(lines), disk: Lines::default(), color, talk: Talk::default(), ref_of: None, target: None, sel: None }
+        Card { id, path: None, title, lang, pane, x, y, w, lines: Lines::new(lines), disk: Lines::default(), color, talk: Talk::default(), ref_of: None, target: None, sel: None, wide: false }
     }
 
     pub fn add_floating(&mut self, title: String, lines: Vec<String>, lang: String, x: f32, y: f32, w: f32, pane: u64, target: Option<Target>) -> u64 {
@@ -509,6 +512,8 @@ impl Doc {
         let at = at.min(self.card(file).unwrap().lines.len());
         let n = c.lines.len();
         self.splice(file, at, del, std::sync::Arc::unwrap_or_clone(c.lines));
+        // snippets marked inside the snippet ride along into the file
+        for r in self.regions.iter_mut().filter(|r| r.file == c.id) { r.file = file; r.start += at; r.end += at; }
         self.regions.push(Region { id: c.id, file, start: at, end: at + n - 1, title: c.title, color: c.color, explained: false, talk: c.talk });
         true
     }
@@ -564,10 +569,8 @@ impl Doc {
     }
 
     pub fn remove_card(&mut self, id: u64) {
-        if self.card(id).is_some_and(Card::is_file) {
-            let ids: Vec<u64> = self.regions.iter().filter(|r| r.file == id).map(|r| r.id).collect();
-            self.drop_regions(&ids);
-        }
+        let ids: Vec<u64> = self.regions.iter().filter(|r| r.file == id).map(|r| r.id).collect();
+        self.drop_regions(&ids);
         self.cards.retain(|c| c.id != id);
         self.ctx.retain(|x| *x != id);
     }
@@ -576,6 +579,8 @@ impl Doc {
         let (first, rest) = ids.split_first()?;
         for id in rest {
             let c = self.card(*id)?.clone();
+            let off = self.card(*first)?.lines.len();
+            for r in self.regions.iter_mut().filter(|r| r.file == *id) { r.file = *first; r.start += off; r.end += off; }
             let f = self.card_mut(*first)?;
             f.lines_mut().extend(c.lines.iter().cloned());
             f.talk.chat.extend(c.talk.chat);
@@ -617,9 +622,9 @@ impl Doc {
             let n = r.end - r.start + 1;
             self.talk_mut(owner).unwrap().draft = None;
             self.splice(r.file, r.start, n, next);
-        } else if let Some(c) = self.card_mut(owner) {
-            c.lines = Lines::new(next);
-            c.talk.draft = None;
+        } else if self.card(owner).is_some() {
+            self.set_file_lines(owner, next);
+            self.card_mut(owner).unwrap().talk.draft = None;
         }
         self.sync_refs();
         true
@@ -663,7 +668,7 @@ mod tests {
     fn doc(lines: &[&str]) -> (Doc, u64) {
         let mut d = Doc::default();
         let id = d.fresh_id();
-        d.cards.push(Card { id, path: Some("a.lua".into()), title: "a.lua".into(), lang: "a.lua".into(), pane: 1, x: 0., y: 0., w: 500., lines: Lines::new(s(lines)), disk: Lines::new(s(lines)), color: 0, talk: Talk::default(), ref_of: None, target: None, sel: None });
+        d.cards.push(Card { id, path: Some("a.lua".into()), title: "a.lua".into(), lang: "a.lua".into(), pane: 1, x: 0., y: 0., w: 500., lines: Lines::new(s(lines)), disk: Lines::new(s(lines)), color: 0, talk: Talk::default(), ref_of: None, target: None, sel: None, wide: false });
         (d, id)
     }
 
@@ -677,6 +682,26 @@ mod tests {
         assert_eq!(xdg_dir(&env, home, "XDG_STATE_HOME", &[".local", "state"]), want);
         env.insert("XDG_STATE_HOME".to_string(), "relative/path".to_string());
         assert_eq!(xdg_dir(&env, home, "XDG_STATE_HOME", &[".local", "state"]), want);
+    }
+
+    #[test]
+    fn snippets_inside_a_snippet_travel_with_it() {
+        let (mut d, f) = doc(&["a", "b", "c"]);
+        let snip = d.add_floating("s".into(), s(&["p", "q", "r", "t"]), "a.lua".into(), 0., 0., 400., 1, None);
+        let inner = d.create_region(snip, 1, 2, None, false, vec![]);
+        // editing the snippet keeps the inner snippet on its lines
+        d.set_file_lines(snip, s(&["new", "p", "q", "r", "t"]));
+        assert_eq!((d.region(inner).unwrap().start, d.region(inner).unwrap().end), (2, 3));
+        // merged into a file at line 1, it lands on the same lines there
+        assert!(d.merge(snip, f, 1, 0));
+        let r = d.region(inner).unwrap();
+        assert_eq!((r.file, r.start, r.end), (f, 3, 4));
+        assert_eq!(d.region_lines(r), s(&["q", "r"]));
+        // a deleted snippet takes the snippets inside it along
+        let snip2 = d.add_floating("s2".into(), s(&["x", "y"]), "a.lua".into(), 0., 0., 400., 1, None);
+        let inner2 = d.create_region(snip2, 0, 0, None, false, vec![]);
+        d.remove_card(snip2);
+        assert!(d.region(inner2).is_none());
     }
 
     #[test]

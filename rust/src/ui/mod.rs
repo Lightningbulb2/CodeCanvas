@@ -61,7 +61,8 @@ pub(crate) enum Drag {
     Move { items: Vec<MoveItem>, sx: f32, sy: f32, moved: bool, single: Option<u64> },
     Select { id: u64 },
     EditSelect { id: u64 },
-    Resize { id: u64, sx: f32, ow: f32, z: f32 },
+    /// Width from the right edge or corner; from the left edge the card's left side moves instead.
+    Resize { id: u64, sx: f32, ow: f32, ox: f32, left: bool, z: f32 },
     Region { id: u64, via: Via, sx: f32, sy: f32, wx: f32, wy: f32, pane: u64 },
     Edge { id: u64, top: bool, orig: (usize, usize), moved: bool, sx: f32, sy: f32 },
     ShiftLines { id: u64, a: usize, b: usize, sy: f32, wy: f32, pane: u64 },
@@ -171,6 +172,10 @@ pub struct CanvasView {
     pub(crate) selected: HashSet<u64>,
     pub(crate) picked: Option<u64>,
     pub(crate) hover_tab: Option<u64>,
+    /// The over-wide line the pointer rests on: (card, line). Its hidden part is shown beside the card.
+    pub(crate) peek: Option<(u64, usize)>,
+    /// Per card: the widest line in columns, for the lines it was measured from.
+    pub(crate) widest: HashMap<u64, (Lines, usize)>,
     pub(crate) doomed: Vec<u64>,
     undo: Vec<Doc>,
     redo: Vec<Doc>,
@@ -226,7 +231,6 @@ pub struct CanvasView {
     pub(crate) scale: f32,
     pub(crate) dead_tiles: Vec<Arc<gpui::RenderImage>>,
     /// Dot-grid tiles by dot spacing in device pixels, most recent last.
-    pub(crate) dot_tiles: Vec<(u32, Arc<gpui::RenderImage>)>,
     pub(crate) ascii_glyphs: Rc<std::cell::RefCell<render::AsciiGlyphs>>,
     /// Current widths of the explorer and the global chat (they slide open and shut).
     pub(crate) side: (f32, f32),
@@ -349,10 +353,10 @@ impl CanvasView {
         let tree = project.tree();
         let mut this = Self {
             project, settings, tree, doc: Doc { next_id: 1, ..Default::default() }, layout: Layout::Pane(1), views: HashMap::from([(1, pv)]), shared: true, active: 1,
-            drag: None, live: None, selected: HashSet::new(), picked: None, hover_tab: None, doomed: Vec::new(), undo: Vec::new(), redo: Vec::new(),
+            drag: None, live: None, selected: HashSet::new(), picked: None, hover_tab: None, peek: None, widest: HashMap::new(), doomed: Vec::new(), undo: Vec::new(), redo: Vec::new(),
             inputs: HashMap::new(), focus_input: None, editing: None, busy: HashMap::new(), tx, rx, explaining: HashMap::new(), explain_queue: None, menu: None, pick: None,
             models: None, show_settings: false, show_help: false, expanded: HashSet::new(), chat_open: true, explorer_open: true, hist_open: true, spans: HashMap::new(), scrolls: HashMap::new(),
-            pending_bottom: HashSet::new(), chat_lists: HashMap::new(), chat_view: { let canvas = cx.weak_entity(); gpui::AppContext::new(cx, |_| ChatPanelView { canvas }) }, chat_key: 0, ui_font, chrome: [Part::Top, Part::Explorer, Part::Context].into_iter().map(|part| { let canvas = cx.weak_entity(); (part, gpui::AppContext::new(cx, |_| ChromeView { canvas, part }), 0) }).collect(), space: false, toasts: Vec::new(), char_ratio, anim: HashMap::new(), fx: Fx::default(), finds: HashMap::new(), tiles: HashMap::new(), tile_shown: HashMap::new(), zoom_aim: HashMap::new(), tile_levels: HashMap::new(), tile_pool: tiles::Pool::new(mono()), tile_inbox: Default::default(), frame: 0, scale: 1., dead_tiles: Vec::new(), dot_tiles: Vec::new(), ascii_glyphs: Default::default(), side: (EXPLORER_W, CHAT_W), sel_at: Instant::now(), started: Instant::now(), focus, win_size: (1500., 950.), mouse: (0., 0.), mods: Default::default(),
+            pending_bottom: HashSet::new(), chat_lists: HashMap::new(), chat_view: { let canvas = cx.weak_entity(); gpui::AppContext::new(cx, |_| ChatPanelView { canvas }) }, chat_key: 0, ui_font, chrome: [Part::Top, Part::Explorer, Part::Context].into_iter().map(|part| { let canvas = cx.weak_entity(); (part, gpui::AppContext::new(cx, |_| ChromeView { canvas, part }), 0) }).collect(), space: false, toasts: Vec::new(), char_ratio, anim: HashMap::new(), fx: Fx::default(), finds: HashMap::new(), tiles: HashMap::new(), tile_shown: HashMap::new(), zoom_aim: HashMap::new(), tile_levels: HashMap::new(), tile_pool: tiles::Pool::new(mono()), tile_inbox: Default::default(), frame: 0, scale: 1., dead_tiles: Vec::new(), ascii_glyphs: Default::default(), side: (EXPLORER_W, CHAT_W), sel_at: Instant::now(), started: Instant::now(), focus, win_size: (1500., 950.), mouse: (0., 0.), mods: Default::default(),
             state_dirty: None, mtimes: HashMap::new(), last_poll: Instant::now(), inbox, saver, doc_dirty: true,
         };
         if let Some(s) = this.project.load_state() {
@@ -442,8 +446,13 @@ impl CanvasView {
 
     pub(crate) fn card_height(&self, c: &Card) -> f32 { HEAD + PAD * 2. + c.lines.len() as f32 * LH }
 
-    fn file_under(&self, pane: u64, wx: f32, wy: f32) -> Option<u64> {
-        self.doc.cards.iter().rev().find(|c| c.is_file() && self.in_pane(c, pane) && wx >= c.x && wx <= c.x + c.w && wy >= c.y && wy <= c.y + self.card_height(c) + 40.).map(|c| c.id)
+    fn file_under(&self, pane: u64, wx: f32, wy: f32) -> Option<u64> { self.drop_target(pane, wx, wy, false) }
+
+    /// The card a dragged block would land in: files, and with `snippets` also snippets (whose lines are
+    /// their own, so not references, and not a card being dragged as a whole).
+    fn drop_target(&self, pane: u64, wx: f32, wy: f32, snippets: bool) -> Option<u64> {
+        let ghost = self.live.as_ref().and_then(|l| l.ghost_card);
+        self.doc.cards.iter().rev().find(|c| (c.is_file() || (snippets && c.ref_of.is_none() && Some(c.id) != ghost)) && self.in_pane(c, pane) && wx >= c.x && wx <= c.x + c.w && wy >= c.y && wy <= c.y + self.card_height(c) + 40.).map(|c| c.id)
     }
 
     fn line_at(&self, c: &Card, pane: u64, sy: f32) -> usize {
@@ -474,7 +483,7 @@ impl CanvasView {
         };
         let id = self.doc.fresh_id();
         let lines = Lines::new(lines); // shared with `disk` until the card is edited
-        self.doc.cards.push(Card { id, title: rel.clone(), lang: rel.clone(), path: Some(rel), pane, x, y, w, disk: lines.clone(), lines, color: 0, talk: Talk::default(), ref_of: None, target: None, sel: None });
+        self.doc.cards.push(Card { id, title: rel.clone(), lang: rel.clone(), path: Some(rel), pane, x, y, w, disk: lines.clone(), lines, color: 0, talk: Talk::default(), ref_of: None, target: None, sel: None, wide: false });
         self.touch();
     }
 
@@ -827,6 +836,51 @@ impl CanvasView {
             cx.notify();
         }
         if self.drag.is_some() { self.pointer_moved(x, y, e.modifiers); cx.notify(); }
+        let peek = if self.drag.is_none() { self.peek_at(x, y) } else { None };
+        if peek != self.peek { self.peek = peek; cx.notify(); }
+    }
+
+    /// Columns of code that fit across a card (wider lines are cut off at its right edge).
+    pub(crate) fn fit_cols(&self, c: &Card, n_lines: usize) -> usize { ((c.w - self.gutter(n_lines) - 14.) / self.char_w(1.)).floor().max(1.) as usize }
+
+    /// The lines a card shows: the editor's while it is being edited.
+    pub(crate) fn shown_lines(&self, id: u64) -> Option<&[String]> {
+        if self.editing == Some(id) { if let Some(b) = self.inputs.get(&Input::Editor(id)) { return Some(&b.lines); } }
+        self.doc.card(id).map(|c| c.lines.as_slice())
+    }
+
+    /// Whether any line of a card is wider than the card (measured once per version of its lines).
+    pub(crate) fn has_wide(&mut self, c: &Card) -> bool {
+        let fit = self.fit_cols(c, c.lines.len());
+        if self.editing == Some(c.id) { return self.shown_lines(c.id).is_some_and(|l| l.iter().any(|l| visual_len(l) > fit)); }
+        let w = match self.widest.get(&c.id) {
+            Some((l, w)) if std::sync::Arc::ptr_eq(l, &c.lines) => *w,
+            _ => { let w = c.lines.iter().map(|l| visual_len(l)).max().unwrap_or(0); self.widest.insert(c.id, (c.lines.clone(), w)); w }
+        };
+        w > fit
+    }
+
+    /// The over-wide line under the pointer, or just right of its card (where its hidden part shows).
+    fn peek_at(&self, x: f32, y: f32) -> Option<(u64, usize)> {
+        let pane = self.pane_at(x, y)?.id;
+        let z = self.pv(pane).v.z;
+        if z < FAR_Z || self.live.is_some() { return None; }
+        let (wx, wy) = self.to_world(pane, x, y);
+        let row = |c: &Card| { let p = (wy - c.y - HEAD - PAD) / LH; (p >= 0.).then(|| p as usize) };
+        let wide = |c: &Card, i: usize| -> Option<usize> { let l = self.shown_lines(c.id)?.get(i)?; let (n, f) = (visual_len(l), self.fit_cols(c, c.lines.len())); (n > f).then_some(n) };
+        // the card the pointer is on, if any, decides; over empty canvas, a peek already open stays while the
+        // pointer is on its row and within the line's length
+        let cards = || self.doc.cards.iter().rev().filter(|c| self.in_pane(c, pane));
+        let top = cards().find(|c| wx >= c.x && wx <= c.x + c.w && wy >= c.y && wy <= c.y + self.card_height(c));
+        if let Some(c) = top {
+            if c.wide || self.editing == Some(c.id) { return None; }
+            let i = row(c)?;
+            return wide(c, i).map(|_| (c.id, i));
+        }
+        let (id, i) = self.peek?;
+        let c = self.doc.card(id)?;
+        let n = wide(c, i)?;
+        (row(c) == Some(i) && wx <= c.x + self.gutter(c.lines.len()) + n as f32 * self.char_w(1.) + 24.).then_some((id, i))
     }
 
     fn pointer_moved(&mut self, x: f32, y: f32, m: gpui::Modifiers) {
@@ -886,7 +940,13 @@ impl CanvasView {
                 }
                 drag
             }
-            Drag::Resize { id, sx, ow, z } => { if let Some(c) = self.doc.card_mut(id) { c.w = (ow + (x - sx) / z).max(240.); } drag }
+            Drag::Resize { id, sx, ow, ox, left, z } => {
+                if let Some(c) = self.doc.card_mut(id) {
+                    let d = (x - sx) / z;
+                    if left { c.w = (ow - d).max(240.); c.x = ox + ow - c.w; } else { c.w = (ow + d).max(240.); }
+                }
+                drag
+            }
             Drag::Region { id, via, sx, sy, wx, wy, pane } => {
                 if self.live.is_none() {
                     if (x - sx).hypot(y - sy) >= 5. { self.begin_region_live(id, pane); }
@@ -967,7 +1027,7 @@ impl CanvasView {
     /// `gx`/`gy` are the dragged block's card origin in world units; `py` is the pointer's world y.
     fn live_hover(&mut self, pane: u64, gx: f32, gy: f32, py: f32, alt_blocks: bool) {
         let Some(l) = &self.live else { return };
-        let over = if l.lock { l.src.map(|s| s.0) } else if alt_blocks { None } else { self.file_under(pane, gx + (l.gw * 0.3).min(160.), py) };
+        let over = if l.lock { l.src.map(|s| s.0) } else if alt_blocks { None } else { self.drop_target(pane, gx + (l.gw * 0.3).min(160.), py, l.ghost_card.is_none()) };
         let mut at = 0;
         if let Some(f) = over {
             let c = self.doc.card(f).unwrap();
@@ -1234,9 +1294,9 @@ impl CanvasView {
         let Some(b) = self.inputs.remove(&Input::Editor(id)) else { return };
         let Some(c) = self.doc.card(id) else { return };
         if *c.lines == b.lines { return; }
-        let is_file = c.is_file();
         self.snapshot();
-        if is_file { self.doc.set_file_lines(id, b.lines); } else { self.doc.card_mut(id).unwrap().lines = Lines::new(b.lines); }
+        // through the diff splice for snippets too, so the snippets marked inside them survive the edit
+        self.doc.set_file_lines(id, b.lines);
         self.touch();
     }
 
@@ -1274,7 +1334,7 @@ impl CanvasView {
             Some(Drag::Select { id }) => if let Some(c) = self.doc.card_mut(id) { c.sel = None; },
             Some(Drag::ShiftLines { id, a, b, .. }) => if let Some(c) = self.doc.card_mut(id) { c.sel = Some((a, b)); },
             Some(Drag::Marquee { base, .. }) => self.selected = base,
-            Some(Drag::Resize { id, ow, .. }) => if let Some(c) = self.doc.card_mut(id) { c.w = ow; },
+            Some(Drag::Resize { id, ow, ox, .. }) => if let Some(c) = self.doc.card_mut(id) { c.w = ow; c.x = ox; },
             _ => {}
         }
         self.live = None;
@@ -1417,11 +1477,12 @@ impl CanvasView {
     pub(crate) fn apply_draft(&mut self, id: u64) {
         self.snapshot();
         let owner = self.doc.draft_owner(id);
-        let added: Vec<usize> = match (self.doc.region(owner), self.doc.talk(owner).and_then(|t| t.draft.clone())) {
-            (Some(r), Some(d)) => crate::diff::diff_lines(&self.doc.region_lines(r), &d).into_iter().filter_map(|o| match o { crate::diff::Op::Add(b) => Some(r.start + b), _ => None }).collect(),
-            _ => Vec::new(),
+        // the lines the draft adds, to flash where they land
+        let (file, at) = match self.doc.region(owner) { Some(r) => (Some(r.file), r.start), None => (self.doc.card(owner).map(|c| c.id), 0) };
+        let added: Vec<usize> = match self.doc.talk(owner).and_then(|t| t.draft.clone()) {
+            Some(d) => crate::diff::diff_lines(&self.doc.base_lines(owner), &d).into_iter().filter_map(|o| match o { crate::diff::Op::Add(b) => Some(at + b), _ => None }).collect(),
+            None => Vec::new(),
         };
-        let file = self.doc.region(owner).map(|r| r.file);
         if self.doc.apply_draft(id) {
             if let Some(f) = file { for l in added { self.fx.line(f, l, 1, LineKind::Flash, 0.); } }
             self.toast("Draft applied", false); let o = self.doc.draft_owner(id); let base = self.doc.base_lines(o); if let Some(t) = self.doc.talk_mut(o) { t.draft = Some(base); } self.touch(); }
@@ -1432,7 +1493,10 @@ impl CanvasView {
         if owner == 0 { return (self.doc.ctx.iter().filter_map(|i| self.doc.ctx_item(*i)).collect(), None); }
         let mut items: Vec<_> = self.doc.ctx_item(owner).into_iter().collect();
         if self.doc.talk(owner).is_some_and(|t| t.global) { items.extend(self.doc.ctx.iter().filter(|i| **i != owner).filter_map(|i| self.doc.ctx_item(*i))); }
-        let focus = if let Some(c) = self.doc.card(owner).filter(|c| c.is_file()) { format!("the file {}", c.path.as_deref().unwrap_or("")) } else {
+        let focus = if let Some(c) = self.doc.card(owner).filter(|c| c.is_file()) {
+            let p = c.path.as_deref().unwrap_or("");
+            format!("the file {p}. If you propose changes to this file, give each change as a ```snippet block with file=\"{p}\" and replace=\"A-B\" (or insert=\"N\"), using the file's line numbers as they are now; the changes are combined into one diff draft that the user reviews and applies")
+        } else {
             let (title, place) = match self.doc.region(owner) {
                 Some(r) => (r.title.clone(), format!("{} lines {}-{}", self.doc.card(r.file).and_then(|f| f.path.clone()).unwrap_or_default(), r.start + 1, r.end + 1)),
                 None => { let c = self.doc.card(owner); (c.map_or(String::new(), |c| c.title.clone()), "a free-floating snippet".to_string()) }
@@ -1578,19 +1642,6 @@ impl CanvasView {
     }
 
     /// The dot-grid tile for a dot spacing (device pixels), made once and kept for the last few spacings.
-    pub(crate) fn dot_tile(&mut self, gap: u32) -> Option<(Arc<gpui::RenderImage>, u32)> {
-        let per = (512 / gap.max(1)).clamp(1, 16);
-        if let Some(i) = self.dot_tiles.iter().position(|(g, _)| *g == gap) {
-            let t = self.dot_tiles.remove(i);
-            self.dot_tiles.push(t);
-        } else {
-            let img = tiles::dot_tile(gap, per, render::FG, 0.13)?;
-            self.dot_tiles.push((gap, img));
-            if self.dot_tiles.len() > 6 { let (_, old) = self.dot_tiles.remove(0); self.dead_tiles.push(old); }
-        }
-        self.dot_tiles.last().map(|(_, img)| (img.clone(), per))
-    }
-
     /// Once per frame: take in the cells the workers finished (a few per frame, see `UPLOAD_PER_FRAME`),
     /// forget cells nothing has drawn for half a second (they are quick to redo), and keep the rest
     /// within a memory budget.
@@ -1672,8 +1723,18 @@ impl CanvasView {
         }
     }
 
-    /// Replies aimed at this snippet become its draft; everything else becomes cards on the canvas.
+    /// Replies aimed at this snippet become its draft, and changes to a file's own lines become the
+    /// file's draft; everything else becomes cards on the canvas.
     fn route_drafts(&mut self, owner: u64, mut drafts: Vec<Draft>) {
+        if let Some(path) = self.doc.card(owner).and_then(|c| c.path.clone()) {
+            let mine: Vec<Draft> = { let (m, rest): (Vec<Draft>, Vec<Draft>) = drafts.into_iter().partition(|d| d.file.as_deref() == Some(path.as_str())); drafts = rest; m };
+            if !mine.is_empty() {
+                let lines = file_draft(&self.doc.base_lines(owner), &mine);
+                if let Some(t) = self.doc.talk_mut(owner) { t.draft = Some(lines); t.draft_open = true; }
+            }
+            self.spawn_drafts(drafts, owner);
+            return;
+        }
         let is_snippet = owner != 0 && !self.doc.card(owner).is_some_and(Card::is_file);
         if is_snippet {
             let o = self.doc.draft_owner(owner);
@@ -1840,7 +1901,7 @@ pub(crate) fn fingerprint(lines: &[String]) -> u64 {
 }
 
 pub(crate) fn visual_len(s: &str) -> usize { s.chars().map(|c| if c == '\t' { 4 } else { 1 }).sum() }
-fn visual_to_chars(s: &str, vis: usize) -> usize {
+pub(crate) fn visual_to_chars(s: &str, vis: usize) -> usize {
     let (mut v, mut n) = (0, 0);
     for c in s.chars() {
         if v >= vis { break; }
@@ -1848,4 +1909,49 @@ fn visual_to_chars(s: &str, vis: usize) -> usize {
         n += 1;
     }
     n
+}
+
+/// A file's lines with the changes the LLM suggested for it applied: each `replace="A-B"` /
+/// `insert="N"` is in the file's numbering before any change, so they are applied bottom-up. A block
+/// with neither is the whole new file.
+fn file_draft(base: &[String], changes: &[Draft]) -> Vec<String> {
+    let split = |c: &str| c.trim_end_matches('\n').split('\n').map(String::from).collect::<Vec<_>>();
+    if let Some(whole) = changes.iter().rev().find(|d| d.replace.is_none() && d.insert_at.is_none()) { return split(&whole.code); }
+    let n = base.len();
+    let mut at: Vec<(usize, usize, Vec<String>)> = changes.iter().map(|d| match (d.replace, d.insert_at) {
+        (Some((a, b)), _) => { let a = a.saturating_sub(1).min(n); (a, b.min(n).max(a) - a, split(&d.code)) }
+        (None, Some(i)) => (i.saturating_sub(1).min(n), 0, split(&d.code)),
+        _ => (n, 0, Vec::new()),
+    }).collect();
+    at.sort_by(|x, y| y.0.cmp(&x.0));
+    let mut out = base.to_vec();
+    let mut floor = usize::MAX;
+    for (a, del, ins) in at {
+        // overlapping suggestions: the later one in the file wins
+        let del = del.min(floor.saturating_sub(a));
+        out.splice(a..a + del, ins);
+        floor = a;
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn s(v: &[&str]) -> Vec<String> { v.iter().map(|x| x.to_string()).collect() }
+    fn d(code: &str, replace: Option<(usize, usize)>, insert_at: Option<usize>) -> Draft {
+        Draft { title: String::new(), file: Some("f".into()), insert_at, replace, code: code.into(), lang: None }
+    }
+
+    #[test]
+    fn file_drafts_apply_every_change_in_the_original_numbering() {
+        let base = s(&["1", "2", "3", "4", "5"]);
+        // two replacements and an insert, given top-down in the reply
+        let out = file_draft(&base, &[d("one", Some((1, 1)), None), d("new\nlines", None, Some(3)), d("FOUR\nFIVE", Some((4, 5)), None)]);
+        assert_eq!(out, s(&["one", "2", "new", "lines", "3", "FOUR", "FIVE"]));
+        // a block with no place is the whole new file
+        assert_eq!(file_draft(&base, &[d("a\nb", None, None)]), s(&["a", "b"]));
+        // out-of-range numbers are clamped instead of panicking
+        assert_eq!(file_draft(&base, &[d("end", None, Some(99)), d("x", Some((9, 12)), None)]), s(&["1", "2", "3", "4", "5", "x", "end"]));
+    }
 }

@@ -260,27 +260,6 @@ pub(crate) fn tok_rgb(t: Tok) -> u32 {
     match t { Tok::Keyword => 0xc678dd, Tok::Str => 0x98c379, Tok::Num => 0xd19a66, Tok::Comment => 0x6b7280, Tok::Type => 0xe5c07b, Tok::Func => 0x61afef }
 }
 
-/// A square of the canvas's dot grid, `per` dots a side at `gap` device pixels apart, each a 2×2
-/// block centred in its spot. Drawing the grid as a few of these instead of a quad per dot takes
-/// thousands of primitives out of every frame.
-pub(crate) fn dot_tile(gap: u32, per: u32, rgb_: u32, alpha: f32) -> Option<Arc<RenderImage>> {
-    let side = (gap * per) as usize;
-    let mut px = vec![0u8; side * side * 4];
-    let [r, g, b] = rgb(rgb_);
-    let a = (alpha * 255.).round() as u8;
-    for j in 0..per as usize {
-        for i in 0..per as usize {
-            let (cx, cy) = (i * gap as usize + gap as usize / 2, j * gap as usize + gap as usize / 2);
-            for y in cy.saturating_sub(1)..(cy + 1).min(side) {
-                for x in cx.saturating_sub(1)..(cx + 1).min(side) {
-                    px[(y * side + x) * 4..][..4].copy_from_slice(&[b, g, r, a]);
-                }
-            }
-        }
-    }
-    image(side as u32, side as u32, px)
-}
-
 /// Wraps tile pixels as an image GPUI can draw.
 pub(crate) fn image(w: u32, h: u32, bgra: Vec<u8>) -> Option<Arc<RenderImage>> {
     let buf = image::RgbaImage::from_raw(w, h, bgra)?;

@@ -3,7 +3,7 @@
 use super::fx::{Rich, ease_out, ext_color, icon, ms_since};
 use super::panels::{tool, tool_with};
 use super::*;
-use crate::model::Card;
+use crate::model::{Card, Lines};
 use gpui::{
     AnyElement, BorderStyle, Bounds, BoxShadow, Div, Font, FontWeight, HighlightStyle, Hsla, MouseButton, PathBuilder, Render, SharedString, StyledText, TextRun, Transformation, canvas, div,
     fill, point, prelude::*, quad, radians, rgb, size, transparent_black,
@@ -230,10 +230,13 @@ impl CanvasView {
         // Lines that opaque cards drawn above this one hide completely are neither drawn nor cached.
         let hidden = hidden_lines(above, (sx.max(0.), (sx + card.w * z).min(vw)), top_px + PAD * z, lh, first, last);
         let mut layer = div().absolute().left_0().top(px(HEAD * z)).w_full().bottom_0().overflow_hidden()
-            .when(card.is_file() || editing, |d| d.cursor_text())
+            .when(card.ref_of.is_none() || editing, |d| d.cursor_text())
             .on_mouse_down(MouseButton::Left, cx.listener(move |t, e: &MouseDownEvent, _, cx| {
-                let is_file = t.doc.card(id).is_some_and(Card::is_file);
-                if is_file || t.editing == Some(id) { t.file_body_down(id, pane, e, cx); }
+                // files and snippets alike: click and drag select lines, Shift+drag moves them, a double
+                // click edits; Space+drag (or the header) moves the card. A reference mirrors another
+                // snippet's lines, so dragging it moves it.
+                let own_lines = t.doc.card(id).is_some_and(|c| c.ref_of.is_none());
+                if own_lines || t.editing == Some(id) { t.file_body_down(id, pane, e, cx); }
                 else if t.space { t.start_move(id, e, pane, cx); }
                 else if e.click_count >= 2 { cx.stop_propagation(); t.exit_edit(); t.enter_edit(id, 0, 0); cx.notify(); }
                 else { t.start_move(id, e, pane, cx); }
@@ -512,6 +515,10 @@ impl CanvasView {
         let mut tools = div().flex().flex_none().gap(px(z)).when(!selected && !editing, |d| d.opacity(0.55).group_hover(group, |s| s.opacity(1.)));
         let sz = 14. * z;
         let ctx_color = if in_ctx { OK } else { MUTED };
+        if !editing && self.has_wide(card) {
+            let on = card.wide;
+            tools = tools.child(tool("wide", sz, if on { ACCENT } else { MUTED }, cx, move |t, _, _| { if let Some(c) = t.doc.card_mut(id) { c.wide = !c.wide; } t.touch(); }));
+        }
         if is_file {
             let path = card.path.clone().unwrap();
             let explain = if self.explaining.contains_key(&path) {
@@ -606,7 +613,7 @@ impl CanvasView {
             let settled = !self.fx.slides.contains_key(&src.id) && self.editing != Some(src.id);
             if settled && (ry > vh + 2100. * z || ry + rh < -700. || rx > vw + 1000. || rx + src.w * z + 1000. * z < 0.) { continue; }
             let c = &if z < FAR_Z {
-                Card { id: src.id, path: src.path.clone(), title: src.title.clone(), lang: String::new(), pane: src.pane, x: src.x, y: src.y, w: src.w, lines: Default::default(), disk: Default::default(), color: src.color, talk: Talk::default(), ref_of: src.ref_of, target: None, sel: None }
+                Card { id: src.id, path: src.path.clone(), title: src.title.clone(), lang: String::new(), pane: src.pane, x: src.x, y: src.y, w: src.w, lines: Default::default(), disk: Default::default(), color: src.color, talk: Talk::default(), ref_of: src.ref_of, target: None, sel: None, wide: false }
             } else { src.clone() };
             if ghost_card == Some(c.id) && over.is_some() { continue; } // drawn inside its slot
             let (alpha, rise) = self.fx.card(c.id);
@@ -629,12 +636,16 @@ impl CanvasView {
             let editing = self.editing == Some(c.id);
             let border = if editing { col(WARN) } else if selected { col(ACCENT) } else if c.is_file() { col(BORDER) } else { mix(c.color, BORDER, 0.55) };
             if z < FAR_Z {
+                let cid = c.id;
                 let (dir, base) = dir_and_base(&c.title);
                 let name = if c.ref_of.is_some() { format!("↗ {}", c.title) } else { base.to_string() };
                 let small = if c.is_file() { format!("{dir} · {n_lines} lines") } else { format!("{n_lines} lines") };
                 out.push(self.card_box(sx, sy, sw, sh, z, border).bg(cola(CARD, 0.92)).flex().flex_col().items_center().justify_center().gap(px(2.)).px(px(6.))
                     .child(div().text_size(tpx(15.)).font_weight(FontWeight::SEMIBOLD).text_color(col(if c.is_file() { FG } else { c.color })).whitespace_nowrap().child(name))
-                    .when(sh > 44., |d| d.child(div().text_size(tpx(11.)).text_color(col(MUTED)).whitespace_nowrap().child(small))).into_any_element());
+                    .when(sh > 44., |d| d.child(div().text_size(tpx(11.)).text_color(col(MUTED)).whitespace_nowrap().child(small)))
+                    // zoomed out to names: Space+drag moves the card (a plain drag still pans or selects)
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |t, e: &MouseDownEvent, _, cx| if t.space { t.start_move(cid, e, pane, cx); }))
+                    .into_any_element());
                 continue;
             }
             let id = c.id;
@@ -647,7 +658,7 @@ impl CanvasView {
                 .child(div().absolute().right(px(4. * z)).bottom(px(4. * z)).size(px(6. * z)).border_r_2().border_b_2().border_color(cola(MUTED, 0.5)))
                 .on_mouse_down(MouseButton::Left, cx.listener(move |t, e: &MouseDownEvent, _, cx| {
                     cx.stop_propagation();
-                    if let Some(c) = t.doc.card(id) { let w = c.w; t.drag = Some(Drag::Resize { id, sx: fl(e.position.x), ow: w, z }); }
+                    if let Some(c) = t.doc.card(id) { t.drag = Some(Drag::Resize { id, sx: fl(e.position.x), ow: c.w, ox: c.x, left: false, z }); }
                 }));
             let shadows = if editing { vec![ring(col(WARN)), shadow(10. * z, 30. * z, 0.47)] }
                 else if selected { vec![ring(col(ACCENT)), shadow(10. * z, 30. * z, 0.47)] }
@@ -662,8 +673,27 @@ impl CanvasView {
                 out.push(self.ghost_el(v, true).into_any_element());
                 out.push(lines_overlay.into_any_element());
             } else {
-                let bar = self.find_bar(id, c.w, z, cx);
-                out.push(shell.child(lines).children(regions).child(header).child(resize).children(bar).into_any_element());
+                // While a card is edited, its header (and find bar) stay at the top of the view when the
+                // card's top is scrolled above it, down to the card's last line.
+                let stick = if editing && sy < 0. { (-sy).min((sh - HEAD * z).max(0.)) } else { 0. };
+                let header = if stick > 0. { header.top(px(stick)).shadow(vec![shadow(4. * z, 14. * z, 0.55)]) } else { header };
+                let bar = self.find_bar(id, c.w, z, stick, cx);
+                let (marks, pillars) = self.overflow_els(c, sx, sy, vh, z, cx);
+                out.push(shell.child(lines).children(marks).children(regions).child(header).child(resize).children(bar).into_any_element());
+                // the left and right edges drag to resize, as on a window; just outside the border so they
+                // don't take clicks from the snippet bars
+                let grip = (6. * z).clamp(4., 8.);
+                for left in [true, false] {
+                    let gx = if left { sx - grip } else { sx + sw };
+                    out.push(div().absolute().left(px(gx)).top(px(sy + 9. * z)).w(px(grip)).h(px((sh - 18. * z).max(0.))).cursor_ew_resize()
+                        .hover(|s| s.bg(cola(ACCENT, 0.35))).rounded(px(2.))
+                        .on_mouse_down(MouseButton::Left, cx.listener(move |t, e: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            if let Some(c) = t.doc.card(id) { t.drag = Some(Drag::Resize { id, sx: fl(e.position.x), ow: c.w, ox: c.x, left, z }); }
+                        }))
+                        .into_any_element());
+                }
+                out.extend(pillars);
             }
             drawers.extend(self.overlays(c, pane, sx, sy, sw, z, cx));
         }
@@ -672,6 +702,75 @@ impl CanvasView {
         }
         out.extend(drawers);
         out
+    }
+
+    /// Lines wider than the card: a fade and a bright edge where each is cut off (inside the card), and
+    /// the hidden rest of the line as a pillar sticking out of the card's right side. Pillars show for
+    /// every such line while the card is edited or its overflow toggle is on, otherwise only for the
+    /// line the pointer rests on.
+    #[allow(clippy::too_many_arguments)]
+    fn overflow_els(&mut self, c: &Card, sx: f32, sy: f32, vh: f32, z: f32, cx: &mut Context<Self>) -> (Vec<AnyElement>, Vec<AnyElement>) {
+        let (mut marks, mut pillars) = (Vec::new(), Vec::new());
+        let id = c.id;
+        let editing = self.editing == Some(id);
+        // the card's own shared lines (no copy), or the editor's while it is being edited
+        let lines: Lines = if editing { match self.inputs.get(&Input::Editor(id)) { Some(b) => Lines::new(b.lines.clone()), None => return (marks, pillars) } } else { c.lines.clone() };
+        let fit = self.fit_cols(c, c.lines.len());
+        let (lh, cw) = (LH * z, self.char_w(z));
+        let gutter = self.gutter(c.lines.len()) * z;
+        let top = sy + (HEAD + PAD) * z;
+        let first = ((-top / lh).floor().max(0.) as usize).min(lines.len());
+        let last = (((vh - top) / lh).ceil().max(0.) as usize + 1).min(lines.len());
+        let all = editing || c.wide;
+        let peek = self.peek.filter(|p| p.0 == id).map(|p| p.1);
+        let spans = self.spans.get(&id).map(|s| s.1.clone());
+        let caret = if editing { self.inputs.get(&Input::Editor(id)).map(|b| (b.cur.line, visual_len(&b.lines[b.cur.line][..b.cur.col]))) } else { None };
+        // nothing sticks out from under the header, which stays in view while the card is edited
+        let head_bottom = if editing { sy.max(0.) } else { sy } + HEAD * z;
+        for i in first..last {
+            let n = visual_len(&lines[i]);
+            if n <= fit { continue; }
+            let y = (HEAD + PAD + i as f32 * LH) * z;
+            if sy + y < head_bottom - 0.5 { continue; }
+            let open = all || peek == Some(i);
+            if !open {
+                // inside the card, at its right edge: the line runs on past here
+                marks.push(div().absolute().right_0().top(px(y)).h(px(lh)).w(px(22. * z))
+                    .bg(gpui::linear_gradient(90., gpui::linear_color_stop(cola(CARD, 0.), 0.), gpui::linear_color_stop(col(CARD), 0.85)))
+                    .child(div().absolute().right_0().top(px(lh * 0.15)).h(px(lh * 0.7)).w(px((2. * z).max(1.))).rounded(px(1.)).bg(cola(ACCENT, 0.85)))
+                    .into_any_element());
+                continue;
+            }
+            let (text, hl) = display_line(&lines[i], spans.as_ref().and_then(|s| (i < s.len()).then(|| s.line(i))).flatten());
+            let Some(off) = text.char_indices().nth(fit).map(|(b, _)| b) else { continue };
+            let end = text.char_indices().nth(fit + 600).map_or(text.len(), |(b, _)| b);
+            let tail: SharedString = if end < text.len() { format!("{}…", &text[off..end]).into() } else { text[off..].to_string().into() };
+            let hl: Vec<(Range<usize>, HighlightStyle)> = hl.into_iter().filter(|(r, _)| r.end > off && r.start < end).map(|(r, s)| (r.start.max(off) - off..r.end.min(end) - off, s)).collect();
+            let x0 = sx + gutter + fit as f32 * cw;
+            let cols = (n - fit).min(601) as f32;
+            let pad = 8. * z;
+            let caret_x = caret.filter(|(l, col)| *l == i && *col >= fit).map(|(_, col)| (col - fit) as f32 * cw);
+            pillars.push(div().absolute().left(px(x0)).top(px(sy + y)).h(px(lh)).w(px(cols * cw + pad))
+                .bg(col(CARD)).border_1().border_l_0().border_color(cola(ACCENT, 0.45)).rounded_r(px(4. * z)).shadow(vec![shadow(4. * z, 12. * z, 0.4)])
+                .font_family(mono()).text_size(tz(12.5, z)).line_height(px(lh)).text_color(col(FG)).whitespace_nowrap().overflow_hidden().cursor_text()
+                .child(StyledText::new(tail).with_highlights(hl))
+                .children(caret_x.map(|x| div().absolute().left(px(x)).top_0().h_full().w(px((1.5 * z).max(1.))).bg(col(WARN))))
+                .on_mouse_down(MouseButton::Left, cx.listener(move |t, e: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    let col = fit + ((fl(e.position.x) - x0) / cw).round().max(0.) as usize;
+                    let Some(line) = t.shown_lines(id).and_then(|l| l.get(i)).cloned() else { return };
+                    let ch = super::visual_to_chars(&line, col);
+                    if t.editing == Some(id) {
+                        let b = t.input(Input::Editor(id));
+                        b.set_cursor(i, ch, e.modifiers.shift);
+                        if !e.modifiers.shift { b.anchor = Some(b.cur); }
+                        t.focus_input = Some(Input::Editor(id));
+                    } else if e.click_count >= 2 { t.exit_edit(); t.enter_edit(id, i, ch); }
+                    cx.notify();
+                }))
+                .into_any_element());
+        }
+        (marks, pillars)
     }
 
     /// The block being dragged. Over a file it snaps (with a short glide) into the padded slot, header hidden,
@@ -714,7 +813,9 @@ impl CanvasView {
         let mut out = Vec::new();
         let x = sx + sw;
         if c.is_file() {
-            self.chat_stack(c.id, "Chat".to_string(), ACCENT, false, x, sy + 6. * z, pane, z, cx, &mut out);
+            // a file shows its draft tab while the draft is open or holds changes (from its chat, or the menu)
+            let drafted = c.talk.draft_open || self.doc.draft_stats(c.id).is_some_and(|(a, d)| a + d > 0);
+            self.chat_stack(c.id, "Chat".to_string(), ACCENT, drafted, x, sy + 6. * z, pane, z, cx, &mut out);
             let mut last = 30.;
             if self.editing != Some(c.id) {
                 for r in self.doc.marks_of(c.id) {
@@ -727,6 +828,15 @@ impl CanvasView {
             }
         } else {
             self.chat_stack(c.id, c.title.clone(), c.color, true, x, sy + 8. * z, pane, z, cx, &mut out);
+            if self.editing != Some(c.id) {
+                let mut last = 60.;
+                for r in self.doc.marks_of(c.id) {
+                    if self.live.as_ref().is_some_and(|l| l.region == Some(r.id) && !l.ref_mode) { continue; }
+                    let top = f32::max(HEAD + PAD + r.start as f32 * LH + self.line_shift(c.id, r.start), last + 2.);
+                    last = top + TAB_GAP + 22.;
+                    self.chat_stack(r.id, r.title.clone(), r.color, true, x, sy + top * z, pane, z, cx, &mut out);
+                }
+            }
         }
         out
     }
@@ -838,27 +948,28 @@ impl CanvasView {
         let (vx, vy, w, h) = (v.x, v.y, r.w, r.h);
         let links = if v.z < FAR_Z { Vec::new() } else { self.links(pane, v) };
         let dash = [px(6.), px(5.)];
-        // the dot grid, as a few tiles of dots (spacing rounded to whole device pixels)
         let sf = self.scale;
-        let gap = (g * sf).round().max(2.) as u32;
-        let dots = self.dot_tile(gap);
         let backdrop = canvas(|_, _, _| (), move |b: Bounds<Pixels>, _, window, _| {
-            if let Some((img, per)) = dots {
-                let gl = gap as f32 / sf;
-                let side = gl * per as f32;
-                let snap = |v: f32| (v * sf).round() / sf;
-                // a dot sits at every (vx, vy) + k * gl; tiles hold their dots half a spacing in
-                let (x0, y0) = (vx.rem_euclid(gl) - gl / 2. - side, vy.rem_euclid(gl) - gl / 2. - side);
-                let mut y = y0;
-                while y < h {
-                    let mut x = x0;
-                    while x < w {
-                        let _ = window.paint_image(Bounds::new(point(px(snap(fl(b.origin.x) + x)), px(snap(fl(b.origin.y) + y))), size(px(side), px(side))), gpui::Corners::default(), img.clone(), 0, false);
-                        x += side;
+            // The dot grid: a dot at every (vx, vy) + k·g, exactly where the canvas puts it, so the dots
+            // stay fixed to the canvas while zooming (as a browser's background does); only each dot is
+            // snapped to whole device pixels, to stay crisp. One layer, so the dots cost one draw order.
+            let (ox, oy) = (fl(b.origin.x), fl(b.origin.y));
+            let d = 2. / sf;
+            let dot = cola(FG, 0.13);
+            let snap = |v: f32| ((v * sf).round() - 1.) / sf;
+            window.paint_layer(b, |window| {
+                let (kx, ky) = ((-vx / g).ceil(), (-vy / g).ceil());
+                let mut y = vy + ky * g;
+                while y < h + 1. {
+                    let mut x = vx + kx * g;
+                    let sy = snap(oy + y);
+                    while x < w + 1. {
+                        window.paint_quad(fill(Bounds::new(point(px(snap(ox + x)), px(sy)), size(px(d), px(d))), dot));
+                        x += g;
                     }
-                    y += side;
+                    y += g;
                 }
-            }
+            });
             for (c, color) in &links {
                 let at = |i: usize| point(b.origin.x + px(c[i]), b.origin.y + px(c[i + 1]));
                 let mut p = PathBuilder::stroke(px(1.5)).dash_array(&dash);

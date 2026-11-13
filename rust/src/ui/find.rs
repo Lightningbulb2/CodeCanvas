@@ -242,7 +242,7 @@ impl CanvasView {
     }
 
     /// The bar itself, drawn at the top right of its card.
-    pub(crate) fn find_bar(&mut self, id: u64, card_w: f32, z: f32, cx: &mut Context<Self>) -> Option<Div> {
+    pub(crate) fn find_bar(&mut self, id: u64, card_w: f32, z: f32, stick: f32, cx: &mut Context<Self>) -> Option<Div> {
         self.finds.get(&id)?;
         let hits = self.find_hits(id);
         let f = self.finds.get(&id)?;
@@ -283,7 +283,7 @@ impl CanvasView {
                 .child(act("All", cx, |t, id| t.replace_all(id))));
         }
         let w = (card_w - 28.).clamp(210., 430.) * z;
-        Some(div().absolute().right(px(14. * z)).top(px(HEAD * z)).w(px(w)).flex().items_start().gap(px(3. * z)).p(px(4. * z)).bg(col(0x252830)).border_1().border_color(col(BORDER)).rounded_b(px(5. * z)).shadow(vec![shadow(4. * z, 14. * z, 0.5)])
+        Some(div().absolute().right(px(14. * z)).top(px(HEAD * z + stick)).w(px(w)).flex().items_start().gap(px(3. * z)).p(px(4. * z)).bg(col(0x252830)).border_1().border_color(col(BORDER)).rounded_b(px(5. * z)).shadow(vec![shadow(4. * z, 14. * z, 0.5)])
             .text_color(col(MUTED)).font_weight(FontWeight::NORMAL).cursor_default()
             .on_any_mouse_down(cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()))
             .child(div().flex_none().w(px(16. * z)).h(px(24. * z)).flex().items_center().justify_center().rounded(px(3. * z)).cursor_pointer().hover(|s| s.bg(col(HOVER))).text_size(tz(10., z)).child(if replace { "▾" } else { "▸" })
