@@ -77,7 +77,7 @@ const hostPane = () => panes.get(hostId) || AP();
 function paneOf(c) {
   if (S.shared) return hostPane();
   if (!c) return AP();
-  if (c.fileId) return paneOf(S.files.get(c.fileId));
+  if (c.fileId) return paneOf(hostOf(c.fileId));
   return panes.get(c.pane) || AP();
 }
 /** Is card c visible in pane P? (shared: everything is everywhere) */
@@ -376,6 +376,7 @@ function applyView(P) {
   const { x, y, z } = P.view;
   const el = P.mirror || P.world; // shared mode: non-host panes draw their mirror
   el.style.transform = `translate(${x}px, ${y}px) scale(${z})`;
+  if (S.editing && paneOf(S.editing) === P) stickHeader(S.editing);
   let g = 24 * z;
   while (g < 14) g *= 4;
   P.el.style.backgroundSize = `${g}px ${g}px`;
@@ -461,7 +462,7 @@ export function focusCard(id, line) {
   const P = S.shared ? AP() : paneOf(c);
   setActive(P);
   if (c.fileId) { // anchored snippet
-    const f = S.files.get(c.fileId);
+    const f = hostOf(c.fileId);
     const y = f.y + BODY_TOP + c.start * LH;
     frameRect(f.x, y - 60, f.x + f.w + 360, y + Math.max(200, (c.end - c.start + 1) * LH) + 60, 1, P);
     flashRegion(c);
@@ -484,13 +485,115 @@ function bounds(cs) {
 export const allCards = () => [...S.files.values(), ...[...S.snippets.values()].filter(s => !s.fileId)];
 export const fileByPath = p => [...S.files.values()].find(f => f.path === p);
 const regionsOf = f => [...S.snippets.values()].filter(s => s.fileId === f.id).sort((a, b) => a.start - b.start || b.end - a.end);
-const snippetLines = s => s.fileId ? S.files.get(s.fileId).lines.slice(s.start, s.end + 1) : refSource(s) ? snippetLines(refSource(s)) : s.lines;
+const snippetLines = s => s.fileId ? hostOf(s.fileId).lines.slice(s.start, s.end + 1) : refSource(s) ? snippetLines(refSource(s)) : s.lines;
+/** What a marked snippet lives in: a file, or a floating snippet (snippets can be marked inside snippets too). */
+const hostOf = id => S.files.get(id) || S.snippets.get(id);
+/** A path that names a card's language: the file's own, or the snippet's. */
+const hostPath = c => (!c ? '' : c.type === 'file' ? c.path : snippetPath(c));
+/** Redraws a card after its lines or its marked snippets changed. */
+function renderHost(c) { if (!c) return; if (c.type === 'file') renderFile(c); else if (c.el) renderSnippetCard(c); }
+/** A floating snippet whose lines are its own (not a reference), so it can hold marked snippets. */
+const ownLines = c => c?.type === 'snippet' && !c.fileId && !c.ref;
 const gutterW = n => Math.max(36, String(n).length * charW + 22);
+
+// ---------- lines wider than their card ----------
+const visLen = l => l.replace(/\t/g, '    ').length;
+const codeLeft = c => (c.type === 'file' ? gutterW(c.lines.length) : 44);
+/** Columns of code that fit across card c; longer lines are cut off at its right edge. */
+const fitCols = c => Math.max(1, Math.floor((c.w - 2 - codeLeft(c)) / charW));
+const anyWide = c => { const k = fitCols(c); return c.lines.some(l => visLen(l) > k); };
+/** Marks the rows that run past the card's edge (CSS draws the fade and the bright edge). */
+function markWide(c) {
+  if (!c.linesEl) return;
+  const k = fitCols(c), kids = c.linesEl.children;
+  c.lines.forEach((l, i) => kids[i]?.classList.toggle('wide', visLen(l) > k));
+}
+let peekCard = null;
+/**
+ * The hidden part of wide lines, as pillars sticking out of the card's right side, lined up with the
+ * visible part: every wide line while the card is edited or its overflow toggle is on, otherwise only
+ * the line the pointer rests on. While editing, a click in a pillar places the caret there.
+ */
+function paintPillars(c) {
+  c._pillars?.forEach(p => p.remove());
+  c._pillars = [];
+  c.linesEl?.querySelectorAll('.ln.open').forEach(l => l.classList.remove('open'));
+  if (!c.el?.isConnected || !c.linesEl) return;
+  const ed = S.editing === c ? c._editor : null;
+  const lines = ed ? ed.ta.value.split('\n') : c.lines;
+  const k = fitCols(c);
+  const which = ed || c.wide ? lines.map((_, i) => i).filter(i => visLen(lines[i]) > k)
+    : c._peek != null && visLen(lines[c._peek] || '') > k ? [c._peek] : [];
+  if (!which.length) return;
+  const z = paneOf(c)?.view.z || 1;
+  // positions inside the card are measured from inside its border
+  const cr = c.el.getBoundingClientRect(), bx = c.el.clientLeft, by = c.el.clientTop;
+  const left = ed ? (ed.ta.getBoundingClientRect().left - cr.left) / z - bx : codeLeft(c);
+  const top0 = ((ed ? ed.ta : c.linesEl).getBoundingClientRect().top - cr.top) / z - by;
+  const headBottom = (c.el.querySelector('.card-head')?.getBoundingClientRect().bottom - cr.top) / z || HEAD;
+  let caret = null;
+  if (ed) { const before = ed.ta.value.slice(0, ed.ta.selectionStart).split('\n'); caret = { line: before.length - 1, col: visLen(before[before.length - 1]) }; }
+  for (const i of which) {
+    const top = top0 + i * LH;
+    if (ed && top < headBottom - 0.5) continue; // nothing sticks out from under the header
+    const html = ed ? (ed.hlEl.children[i]?.innerHTML ?? esc(lines[i])) : (c.linesEl.children[i]?.querySelector('.code')?.innerHTML ?? '');
+    const cols = Math.min(visLen(lines[i]) - k, 600);
+    const inner = h('span', { html });
+    inner.style.marginLeft = -k * charW + 'px';
+    const p = h('div', { class: 'pillar' }, inner);
+    Object.assign(p.style, { left: left + k * charW + 'px', top: top + 'px', width: cols * charW + 8 + 'px' });
+    if (caret && caret.line === i && caret.col >= k) p.append(h('div', { class: 'pcaret', style: { left: (caret.col - k) * charW + 'px' } }));
+    p.addEventListener('pointerdown', e => {
+      e.stopPropagation();
+      if (S.editing !== c || !c._editor) return;
+      e.preventDefault();
+      const col = k + Math.max(0, Math.round((e.clientX - p.getBoundingClientRect().left) / (charW * z)));
+      const ta = c._editor.ta, ls = ta.value.split('\n');
+      let ch = 0, v = 0;
+      for (const x of ls[i]) { if (v >= col) break; v += x === '\t' ? 4 : 1; ch++; }
+      const off = ls.slice(0, i).reduce((n, l) => n + l.length + 1, 0) + ch;
+      ta.focus({ preventScroll: true });
+      ta.setSelectionRange(off, off);
+      paintPillars(c);
+    });
+    c.linesEl.children[i]?.classList.add('open');
+    c.el.append(p);
+    c._pillars.push(p);
+  }
+}
+/** Hovering a wide line (or its pillar) shows that line's hidden part. */
+function peekAt(e) {
+  const t = e.target;
+  if (t?.closest?.('.pillar')) return;
+  const c = t?.closest && cardFromEl(t);
+  let i = null;
+  if (c && c.linesEl && S.editing !== c && !c.wide && !paneOf(c)?.far && !drag && c.bodyEl?.contains(t)) {
+    const n = lineAt(c, e.clientY);
+    if (visLen(c.lines[n] || '') > fitCols(c)) i = n;
+  }
+  const target = i == null ? null : c;
+  if (peekCard && (peekCard !== target || peekCard._peek !== i)) { const p = peekCard; peekCard = null; p._peek = null; paintPillars(p); }
+  if (target && target._peek !== i) { target._peek = i; peekCard = target; paintPillars(target); }
+}
+/** While a card is edited, its header and find bar stay at the top of the view when its top scrolls above it. */
+function stickHeader(c) {
+  const head = c?.el?.querySelector('.card-head');
+  if (!head) return;
+  const P = paneOf(c);
+  const top = P ? c.y * P.view.z + P.view.y : 0;
+  const off = S.editing === c && P && top < 0 ? Math.max(0, Math.min(-top / P.view.z, cardH(c) - HEAD - 8)) : 0;
+  head.style.transform = off ? `translateY(${off}px)` : '';
+  head.classList.toggle('stuck', off > 0);
+  const fb = finds.get(c.id)?.el;
+  if (fb) fb.style.transform = off ? `translateY(${off}px)` : '';
+  // pillars that would stick out beside the header are left out (see paintPillars)
+  if (S.editing === c && (c._stuck || 0) !== off) { c._stuck = off; paintPillars(c); }
+}
 /** A path-like string that tells the highlighter what language a snippet is in. */
 function snippetPath(s) {
-  if (s.fileId) return S.files.get(s.fileId)?.path || '';
+  if (s.fileId) return hostPath(hostOf(s.fileId));
   const r = refSource(s);
-  if (r) return S.files.get(r.fileId).path;
+  if (r) return hostPath(hostOf(r.fileId));
   if (s.target?.file) return s.target.file;
   if (s.lang) return /[./]/.test(s.lang) ? s.lang : 'x.' + s.lang;
   return guessLangPath(s.lines || []);
@@ -610,7 +713,7 @@ export async function openFile(path, pos, opts = {}) {
   };
   if (opts.lines) f.lines = opts.lines;
   S.files.set(f.id, f);
-  renderFile(f);
+  renderHost(f);
   mount(f);
   bringToFront(f);
   if (!opts.silent && !pos) focusCard(f.id);
@@ -652,7 +755,7 @@ export function onDiskChange(path, text) {
   if (!f) return;
   const next = text.split(/\r?\n/);
   if (isDirty(f)) { toast(`${path} changed on disk (you have unsaved canvas edits — keeping yours).`, 'info'); f.saved = next.join('\n'); return; }
-  if (setFileLines(f, next)) { f.saved = next.join('\n'); renderFile(f); renderLinks(); }
+  if (setFileLines(f, next)) { f.saved = next.join('\n'); renderHost(f); renderLinks(); }
 }
 
 function renderFile(f) {
@@ -672,6 +775,7 @@ function renderFile(f) {
     iconBtn('ctx', 'Add / remove file from global context', () => toggleCtx(f.id), 'ctx-btn'),
     iconBtn('save', 'Save (Ctrl+S)', () => saveFile(f)),
     iconBtn('editor', `Open in ${EDITOR}`, () => send({ type: 'openInEditor', path: f.path })),
+    anyWide(f) ? iconBtn('wide', 'Show lines wider than the card in full', () => { f.wide = !f.wide; renderHost(f); scheduleSave(); }, f.wide ? 'on' : '') : null,
     iconBtn('close', 'Close', () => closeFile(f)),
   );
   if (S.explaining.has(f.path)) tools.firstChild.classList.add('spin');
@@ -691,7 +795,7 @@ function renderFile(f) {
   f.replEl = h('div', { class: 'replace-indicator' });
   f.bodyEl = h('div', { class: 'card-body' }, linesEl, f.regionsEl, f.selEl, f.dropEl, f.replEl);
   f.marginEl = h('div', { class: 'margin' });
-  el.append(head, f.bodyEl, f.marginEl, h('div', { class: 'resize' }),
+  el.append(head, f.bodyEl, f.marginEl, h('div', { class: 'resize' }), h('div', { class: 'edge-l' }), h('div', { class: 'edge-r' }),
     h('div', { class: 'far-label', html: `<span>${esc(base)}<small>${esc(dir)} · ${f.lines.length} lines</small></span>` }));
   renderRegions(f);
   paintSel(f);
@@ -699,6 +803,8 @@ function renderFile(f) {
   refreshRefs(f);
   sizeFarLabel(f);
   mountFind(f);
+  markWide(f);
+  requestAnimationFrame(() => paintPillars(f));
 }
 
 /** A card drawn while its view is zoomed far out gets its label sized straight away (see applyView). */
@@ -716,16 +822,32 @@ function iconBtn(icon, title, fn, cls = '') {
 
 /** Region overlays inside a file + the margin column: the file's own chat tab, then a chat tab and a draft tab per snippet. */
 function renderRegions(f) {
+  if (!f?.regionsEl) return;
   f.regionsEl.replaceChildren();
-  f.marginEl.querySelectorAll('.mtab').forEach(t => t.remove());
-  // the file's own chat
-  const ftab = buildTab(f);
-  ftab.style.top = '6px';
-  f.marginEl.append(ftab);
-  placeDrawer(ensureDrawer(f).el, f.marginEl, 6, ftab);
+  let lastTabBottom = 30;
+  if (f.type === 'file') {
+    f.marginEl.querySelectorAll('.mtab').forEach(t => t.remove());
+    // the file's own chat, and its draft while that is open or holds changes
+    const ftab = buildTab(f);
+    ftab.style.top = '6px';
+    f.marginEl.append(ftab);
+    placeDrawer(ensureDrawer(f).el, f.marginEl, 6, ftab);
+    const st = draftStats(f);
+    if (f.draftOpen || (st && (st.add || st.del))) {
+      const dtab = buildDraftTab(f);
+      dtab.style.top = 6 + TAB_GAP + 'px';
+      f.marginEl.append(dtab);
+      placeDrawer(ensureDraftUI(f).el, f.marginEl, 6 + TAB_GAP, dtab);
+      if (f.draftOpen) paintDraft(f);
+      lastTabBottom = 30 + TAB_GAP;
+    } else f._draftUI?.el.remove();
+  } else {
+    // a snippet keeps its own chat and draft tabs; those of snippets marked inside it go below
+    f.marginEl.querySelectorAll('.mtab').forEach(t => { if (t.dataset.sid !== f.id) t.remove(); });
+    lastTabBottom = 8 + TAB_GAP + 22;
+  }
 
   const regs = regionsOf(f);
-  let lastTabBottom = 30;
   const tabTops = [];
   for (const s of regs) {
     const top = PAD + s.start * LH;
@@ -794,7 +916,7 @@ function buildDraftTab(s) {
   const tab = h('div', { class: 'mtab draft-tab' + (s.draftOpen ? ' open' : '') + (st && (st.add || st.del) ? ' has-draft' : ''), 'data-sid': s.id, title: 'Draft: an editable copy shown as a diff — LLM suggestions land here' },
     h('span', { class: 'arrow' }, '▶'), h('span', { class: 't' }, '✎ Draft'),
     st && (st.add || st.del) ? h('span', { class: 'dstat', html: `<b class="a">+${st.add}</b> <b class="d">−${st.del}</b>` }) : null);
-  tab.style.setProperty('--rc', s.color);
+  tab.style.setProperty('--rc', s.color || 'var(--accent)');
   tab.addEventListener('pointerdown', e => {
     if (spaceDown) return;
     e.stopPropagation();
@@ -806,7 +928,7 @@ function buildDraftTab(s) {
 }
 
 function highlightRegion(s, on) {
-  const f = S.files.get(s.fileId);
+  const f = hostOf(s.fileId);
   f?.regionsEl.querySelector(`[data-sid="${s.id}"]`)?.classList.toggle('hl', on);
 }
 function flashRegion(s) {
@@ -816,6 +938,7 @@ function flashRegion(s) {
 
 // ---------- line selection inside a file ----------
 function paintSel(f) {
+  if (!f.selEl) return;
   if (!f.sel) { f.selEl.style.display = 'none'; return; }
   const a = Math.min(f.sel.a, f.sel.b), b = Math.max(f.sel.a, f.sel.b);
   Object.assign(f.selEl.style, { display: 'block', top: PAD + a * LH + 'px', height: (b - a + 1) * LH + 'px' });
@@ -830,7 +953,7 @@ function lineAt(c, clientY, boundary) {
 }
 
 function clearAllSel(except) {
-  for (const f of S.files.values()) if (f !== except && f.sel) { f.sel = null; paintSel(f); }
+  for (const f of allCards()) if (f !== except && f.sel) { f.sel = null; paintSel(f); }
   hideSelTools();
 }
 
@@ -871,7 +994,7 @@ function makeSnippetFromSel(f) {
 function copyOut(f, r) {
   pushUndo();
   const lines = f.lines.slice(r.a, r.b + 1);
-  const s = createFloating({ title: guessTitle(lines, f.path, r.a), lines, x: f.x + f.w + 80, y: f.y + BODY_TOP + r.a * LH - 40, pane: paneOf(f).id, lang: f.path });
+  const s = createFloating({ title: guessTitle(lines, hostPath(f), r.a), lines, x: f.x + f.w + 80, y: f.y + BODY_TOP + r.a * LH - 40, pane: paneOf(f).id, lang: hostPath(f) });
   f.sel = null; paintSel(f);
   flyLines(r.a, lines.length, f, s);
 }
@@ -891,7 +1014,7 @@ function guessTitle(lines, path, start) {
 export function createAnchored(f, a, b, props) {
   const lines = f.lines.slice(a, b + 1);
   const s = {
-    id: uid('s'), type: 'snippet', title: props.title || guessTitle(lines, f.path, a), color: props.color || nextColor(),
+    id: uid('s'), type: 'snippet', title: props.title || guessTitle(lines, hostPath(f), a), color: props.color || nextColor(),
     chat: props.chat || [], mode: props.mode || 'snippet', drawerOpen: !!props.drawerOpen, explained: !!props.explained,
     fileId: f.id, start: a, end: b,
   };
@@ -935,6 +1058,7 @@ function renderSnippetCard(s) {
   const tools = h('div', { class: 'tools' });
   if (src) tools.append(iconBtn('editor', 'Jump to the source lines', () => focusCard(src.id)));
   if (s.target?.file) tools.append(iconBtn('merge', 'Apply to its suggested location', () => applyToTarget(s)));
+  if (anyWide(s)) tools.append(iconBtn('wide', 'Show lines wider than the card in full', () => { s.wide = !s.wide; renderSnippetCard(s); scheduleSave(); }, s.wide ? 'on' : ''));
   tools.append(
     iconBtn('search', 'Find and replace in this snippet (Ctrl+F)', () => toggleFind(s)),
     iconBtn('ctx', 'Add / remove from global context', () => toggleCtx(s.id), 'ctx-btn'),
@@ -947,8 +1071,8 @@ function renderSnippetCard(s) {
   const head = h('div', { class: 'card-head' }, h('span', { class: 'ico' }), titleEl, tools);
   const kids = [head];
   if (src) {
-    const sf = S.files.get(src.fileId);
-    const row = h('div', { class: 'target ref-row', title: 'Reference: click to jump to the source. Edits go to the source file.', html: `↗ <b>${esc(sf.path)}</b> lines ${src.start + 1}–${src.end + 1}` });
+    const sf = hostOf(src.fileId);
+    const row = h('div', { class: 'target ref-row', title: 'Reference: click to jump to the source. Edits go to the source file.', html: `↗ <b>${esc(sf.type === 'file' ? sf.path : sf.title)}</b> lines ${src.start + 1}–${src.end + 1}` });
     row.addEventListener('pointerdown', e => { if (!spaceDown) e.stopPropagation(); });
     row.addEventListener('click', e => { e.stopPropagation(); focusCard(src.id); });
     kids.push(row);
@@ -958,26 +1082,34 @@ function renderSnippetCard(s) {
   }
   const start = src ? src.start + 1 : 1;
   const linesEl = h('div', { class: 'lines' });
-  const sfPath = src ? S.files.get(src.fileId).path : null;
+  const sfPath = src ? hostPath(hostOf(src.fileId)) : null;
   linesEl.innerHTML = highlightLines(s.lines, sfPath || snippetPath(s))
     .map((x, i) => `<div class="ln"><span class="no">${start + i}</span><span class="code">${x}</span></div>`).join('');
   s.linesEl = linesEl;
-  s.bodyEl = h('div', { class: 'card-body' }, linesEl);
+  s.regionsEl = h('div', { class: 'regions' });
+  s.selEl = h('div', { class: 'sel-overlay' });
+  s.dropEl = h('div', { class: 'drop-indicator' }, h('span', { class: 'lbl' }));
+  s.replEl = h('div', { class: 'replace-indicator' });
+  s.bodyEl = h('div', { class: 'card-body' }, linesEl, s.regionsEl, s.selEl, s.dropEl, s.replEl);
   const margin = h('div', { class: 'margin' });
+  s.marginEl = margin;
   const tab = buildTab(s);
   tab.style.top = '8px';
   const dtab = buildDraftTab(s);
   dtab.style.top = 8 + TAB_GAP + 'px';
   margin.append(tab, dtab);
-  kids.push(s.bodyEl, margin, h('div', { class: 'resize' }), h('div', { class: 'far-label', html: `<span>${src ? '↗ ' : ''}${esc(s.title)}<small>${plural(s.lines.length, 'line')}</small></span>` }));
+  kids.push(s.bodyEl, margin, h('div', { class: 'resize' }), h('div', { class: 'edge-l' }), h('div', { class: 'edge-r' }), h('div', { class: 'far-label', html: `<span>${src ? '↗ ' : ''}${esc(s.title)}<small>${plural(s.lines.length, 'line')}</small></span>` }));
   el.append(...kids);
   placeDrawer(ensureDrawer(s).el, margin, 8, tab);
   placeDrawer(ensureDraftUI(s).el, margin, 8 + TAB_GAP, dtab);
   if (s.draftOpen) paintDraft(s);
   if (s.drawerOpen) requestAnimationFrame(() => layoutDraftTab(s));
+  if (!src) { renderRegions(s); paintSel(s); }
   positionCard(s);
   sizeFarLabel(s);
   mountFind(s);
+  markWide(s);
+  requestAnimationFrame(() => paintPillars(s));
 }
 
 function renameInline(s, titleEl) {
@@ -996,13 +1128,13 @@ function renameInline(s, titleEl) {
 }
 
 export function renameSnippet(s) {
-  const f = s.fileId && S.files.get(s.fileId);
+  const f = s.fileId && hostOf(s.fileId);
   const el = f ? f.marginEl.querySelector(`.chat-tab[data-sid="${s.id}"] .t`) : s.el?.querySelector('.card-head .title');
   if (el) renameInline(s, el);
 }
 
 function refreshSnippet(s) {
-  if (s.fileId) renderRegions(S.files.get(s.fileId)); else renderSnippetCard(s);
+  if (s.fileId) renderRegions(hostOf(s.fileId)); else renderSnippetCard(s);
   if (s._drawer) s._drawer.titleEl.textContent = s.title;
 }
 
@@ -1017,7 +1149,8 @@ function unlinkRefs(s) {
 }
 
 export function removeSnippet(s, silent) {
-  if (s.fileId && S.files.get(s.fileId)) unlinkRefs(s);
+  for (const x of regionsOf(s)) removeSnippet(x, true); // the snippets marked inside it go with it
+  if (s.fileId && hostOf(s.fileId)) unlinkRefs(s);
   const src = refSource(s);
   if (s.el) { s.el.remove(); s.el = null; }
   s._drawer?.el.remove();
@@ -1025,8 +1158,8 @@ export function removeSnippet(s, silent) {
   S.snippets.delete(s.id);
   S.selected.delete(s.id);
   removeFromCtx(s.id);
-  if (!silent && s.fileId && S.files.get(s.fileId)) renderRegions(S.files.get(s.fileId));
-  if (src && S.files.get(src.fileId)) renderRegions(S.files.get(src.fileId));
+  if (!silent && s.fileId && hostOf(s.fileId)) renderRegions(hostOf(s.fileId));
+  if (src && hostOf(src.fileId)) renderRegions(hostOf(src.fileId));
   renderLinks();
   scheduleSave();
 }
@@ -1051,7 +1184,7 @@ function ensureDrawer(s) {
   const chat = createChat({
     messages: () => s.chat,
     context: () => (isFile ? fileContext(s) : snippetContext(s)),
-    onSnippets: snips => (isFile ? spawnDrafts(snips, s) : routeDrafts(s, snips)),
+    onSnippets: snips => (isFile ? routeFileDrafts(s, snips) : routeDrafts(s, snips)),
     onCodeToSnippet: (code, info, attrs) => spawnDrafts([{ title: attrs.title || 'From chat', code, file: attrs.file, insertAt: +attrs.insert || undefined, lang: (info || '').split(/\s/)[0] || undefined }], s),
     onCodeToDraft: isFile ? null : code => setDraft(s, code),
     onFocusSnippet: id => focusSnippetOrDraft(id),
@@ -1089,7 +1222,7 @@ export function toggleDrawer(s, force) {
   s.drawerOpen = force ?? !s.drawerOpen;
   const d = ensureDrawer(s);
   d.el.classList.toggle('closed', !s.drawerOpen);
-  const host = s.fileId ? S.files.get(s.fileId) : s;
+  const host = s.fileId ? hostOf(s.fileId) : s;
   host?.el?.querySelector(`.chat-tab[data-sid="${s.id}"]`)?.classList.toggle('open', s.drawerOpen);
   if (s.drawerOpen) { d.el.style.zIndex = String(++S.zTop); bringToFront(host); d.chat.render(); }
   layoutDraftTab(s);
@@ -1099,7 +1232,7 @@ export function toggleDrawer(s, force) {
 /** The draft tab (and its drawer) live right under the chat tab — or under the chat window when it's open. */
 function layoutDraftTab(s) {
   if (s.type === 'file') return;
-  const host = s.fileId ? S.files.get(s.fileId) : s;
+  const host = s.fileId ? hostOf(s.fileId) : s;
   const tab = host?.el?.querySelector(`.chat-tab[data-sid="${s.id}"]`);
   const dtab = host?.el?.querySelector(`.draft-tab[data-sid="${s.id}"]`);
   if (!tab || !dtab) return;
@@ -1123,9 +1256,9 @@ function toggleAllDrawers(f) {
 function snippetContext(s) {
   const items = [ctxItem(s.id)];
   if (s.mode === 'global') for (const id of S.ctx) if (id !== s.id) { const it = ctxItem(id); it && items.push(it); }
-  const f = s.fileId && S.files.get(s.fileId);
-  const rs = refSource(s), rf = rs && S.files.get(rs.fileId);
-  const where = f ? `${f.path} lines ${s.start + 1}-${s.end + 1}` : rf ? `a live reference to ${rf.path} lines ${rs.start + 1}-${rs.end + 1}` : s.target?.file ? `a draft for ${s.target.file}` : 'a free-floating snippet';
+  const f = s.fileId && hostOf(s.fileId);
+  const rs = refSource(s), rf = rs && hostOf(rs.fileId);
+  const where = f ? `${f.type === 'file' ? f.path : `the snippet "${f.title}"`} lines ${s.start + 1}-${s.end + 1}` : rf ? `a live reference to ${hostPath(rf)} lines ${rs.start + 1}-${rs.end + 1}` : s.target?.file ? `a draft for ${s.target.file}` : 'a free-floating snippet';
   return {
     items,
     focus: `the snippet "${s.title}" (${where}). If you propose changes to this snippet, reply with the COMPLETE revised snippet in exactly one \`\`\`snippet block without file/insert/replace attributes — it is shown to the user as a diff draft`,
@@ -1134,7 +1267,7 @@ function snippetContext(s) {
 function fileContext(f) {
   const items = [ctxItem(f.id)];
   if (f.mode === 'global') for (const id of S.ctx) if (id !== f.id) { const it = ctxItem(id); it && items.push(it); }
-  return { items, focus: `the file ${f.path}` };
+  return { items, focus: `the file ${f.path}. If you propose changes to this file, give each change as a \`\`\`snippet block with file="${f.path}" and replace="A-B" (or insert="N"), using the file's line numbers as they are now; the changes are combined into one diff draft that the user reviews and applies` };
 }
 
 // =====================================================================
@@ -1178,7 +1311,7 @@ export function diffLines(a, b) {
 }
 
 function ensureDraftUI(s) {
-  if (s._draftUI) { s._draftUI.el.classList.toggle('closed', !s.draftOpen); s._draftUI.el.style.setProperty('--rc', s.color); return s._draftUI; }
+  if (s._draftUI) { s._draftUI.el.classList.toggle('closed', !s.draftOpen); s._draftUI.el.style.setProperty('--rc', s.color || 'var(--accent)'); return s._draftUI; }
   const stats = h('span', { class: 'dstats' });
   const editBtn = h('button', { class: 'dbtn', title: 'Edit the draft directly' }, 'Edit');
   const reset = h('button', { class: 'icon-btn', html: icons.reset, title: 'Reset the draft to the current snippet' });
@@ -1189,7 +1322,7 @@ function ensureDraftUI(s) {
   const el = h('div', { class: 'drawer draft-drawer' + (s.draftOpen ? '' : ' closed'), 'data-sid': s.id },
     h('div', { class: 'dr-head' }, h('span', { class: 't' }, '✎ Draft'), stats, editBtn, reset, apply, close),
     body, h('div', { class: 'dask' }, ask));
-  el.style.setProperty('--rc', s.color);
+  el.style.setProperty('--rc', s.color || 'var(--accent)');
   const ui = { el, body, stats, editBtn, ask, editing: false };
   s._draftUI = ui;
   el.addEventListener('pointerdown', e => { e.stopPropagation(); el.style.zIndex = String(++S.zTop); });
@@ -1209,7 +1342,7 @@ function ensureDraftUI(s) {
     ask.value = '';
     const d = ensureDrawer(s);
     if (d.chat.busy) { toast('This snippet\'s chat is still answering.'); return; }
-    d.chat.submit(`Revise this snippet: ${text}`);
+    d.chat.submit(s.type === 'file' ? `Change this file: ${text}` : `Revise this snippet: ${text}`);
     ui.pending = true;
     paintDraft(s);
   });
@@ -1239,14 +1372,23 @@ function paintDraft(s) {
     ui.body.append(ta);
   } else {
     const ops = diffLines(base, o.draft);
-    const path = snippetPath(o);
+    const path = hostPath(o);
     const hA = highlightLines(base, path), hB = highlightLines(o.draft, path);
     const startNo = o.fileId ? o.start + 1 : 1;
-    const rows = ops.map(op => {
+    const changed = ops.map(op => op.t !== ' ');
+    const keep = i => (st.add || st.del) ? changed.slice(Math.max(0, i - 3), i + 4).some(Boolean) : true;
+    const out = [];
+    let skipped = 0;
+    const fold = () => { if (skipped) out.push(`<div class="drow fold">⋯ ${plural(skipped, 'unchanged line')}</div>`); skipped = 0; };
+    ops.forEach((op, i) => {
+      if (!keep(i)) { skipped++; return; }
+      fold();
       const cls = op.t === '+' ? 'add' : op.t === '-' ? 'del' : 'ctx';
       const code = op.t === '+' ? hB[op.b] : hA[op.a];
-      return `<div class="drow ${cls}"><span class="dn">${op.a != null ? startNo + op.a : ''}</span><span class="dn">${op.b != null ? startNo + op.b : ''}</span><span class="dm">${op.t === ' ' ? '' : op.t === '-' ? '−' : '+'}</span><span class="dc">${code || ' '}</span></div>`;
-    }).join('');
+      out.push(`<div class="drow ${cls}"><span class="dn">${op.a != null ? startNo + op.a : ''}</span><span class="dn">${op.b != null ? startNo + op.b : ''}</span><span class="dm">${op.t === ' ' ? '' : op.t === '-' ? '−' : '+'}</span><span class="dc">${code || ' '}</span></div>`);
+    });
+    fold();
+    const rows = out.join('');
     const wrap = h('div', { class: 'diff', html: rows });
     if (!st.add && !st.del) wrap.prepend(h('div', { class: 'dempty' }, ui.pending ? 'Asked the LLM — its revision will appear here as a diff…' : 'No changes yet. Click Edit, or ask the LLM below — suggested changes show up here as a diff you can Apply.'));
     ui.body.append(wrap);
@@ -1254,7 +1396,7 @@ function paintDraft(s) {
 }
 
 function refreshDraftTab(s) {
-  const host = s.fileId ? S.files.get(s.fileId) : s;
+  const host = s.fileId ? hostOf(s.fileId) : s;
   const old = host?.el?.querySelector(`.draft-tab[data-sid="${s.id}"]`);
   if (!old) return;
   const nt = buildDraftTab(s);
@@ -1268,8 +1410,9 @@ export function toggleDraft(s, force) {
   s.draftOpen = force ?? !s.draftOpen;
   const ui = ensureDraftUI(s);
   ui.el.classList.toggle('closed', !s.draftOpen);
-  if (s.draftOpen) { paintDraft(s); ui.el.style.zIndex = String(++S.zTop); bringToFront(s.fileId ? S.files.get(s.fileId) : s); }
-  refreshDraftTab(s);
+  if (s.draftOpen) { paintDraft(s); ui.el.style.zIndex = String(++S.zTop); bringToFront(s.fileId ? hostOf(s.fileId) : s); }
+  if (s.type === 'file') renderRegions(s); // a file's draft tab only shows while it is open or holds changes
+  else refreshDraftTab(s);
   scheduleSave();
 }
 
@@ -1284,7 +1427,7 @@ function setDraft(s, code) {
 /** A snippet chat's reply: the block that revises this snippet becomes its draft, everything else becomes cards. */
 function routeDrafts(s, snips) {
   const o = draftOwner(s);
-  const own = o.fileId ? S.files.get(o.fileId).path : null;
+  const own = o.fileId ? hostOf(o.fileId).path || null : null;
   const idx = snips.findIndex(d => !d.file || (own && d.file === own && (d.replaceStart || !d.insertAt)));
   const rest = snips.filter((_, i) => i !== idx);
   if (idx >= 0) setDraft(s, snips[idx].code);
@@ -1294,8 +1437,42 @@ function routeDrafts(s, snips) {
   return snips.map((_, i) => (i === idx ? 'draft:' + s.id : spawned[k++]));
 }
 
+/**
+ * A file's lines with the changes suggested for it applied. Each replace="A-B" / insert="N" is in the
+ * file's numbering before any change, so they go in bottom-up; a block with neither is the whole new file.
+ */
+export function fileDraft(base, changes) {
+  const split = c => c.replace(/\n$/, '').split('\n');
+  const whole = [...changes].reverse().find(d => !d.replaceStart && !d.insertAt);
+  if (whole) return split(whole.code);
+  const n = base.length;
+  const at = changes.map(d => {
+    if (d.replaceStart) { const a = clamp(d.replaceStart - 1, 0, n); return { a, del: Math.max(Math.min(d.replaceEnd || d.replaceStart, n), a) - a, ins: split(d.code) }; }
+    return { a: clamp(d.insertAt - 1, 0, n), del: 0, ins: split(d.code) };
+  }).sort((x, y) => y.a - x.a);
+  const out = base.slice();
+  let floor = Infinity;
+  for (const { a, del, ins } of at) { out.splice(a, Math.min(del, Math.max(0, floor - a)), ...ins); floor = a; }
+  return out;
+}
+
+/** A file chat's reply: changes to the file's own lines become its draft, everything else becomes cards. */
+function routeFileDrafts(f, snips) {
+  const mine = snips.filter(d => d.file === f.path);
+  const rest = snips.filter(d => d.file !== f.path);
+  if (mine.length) {
+    f.draft = fileDraft(f.lines, mine);
+    if (f._draftUI) { f._draftUI.pending = false; f._draftUI.editing = false; }
+    toggleDraft(f, true);
+    f._draftUI?.el.animate([{ boxShadow: '0 0 0 2px var(--ok)' }, { boxShadow: '0 0 0 0 transparent' }], { duration: 900 });
+  }
+  const spawned = spawnDrafts(rest, f);
+  let k = 0;
+  return snips.map(d => (d.file === f.path ? 'draft:' + f.id : spawned[k++]));
+}
+
 function focusSnippetOrDraft(id) {
-  if (id.startsWith('draft:')) { const s = S.snippets.get(id.slice(6)); if (s) { toggleDraft(s, true); focusCard(s.id); } return; }
+  if (id.startsWith('draft:')) { const s = hostOf(id.slice(6)); if (s) { toggleDraft(s, true); focusCard(s.id); } return; }
   focusCard(id);
 }
 
@@ -1308,16 +1485,22 @@ function applyDraft(s) {
   const ops = diffLines(base, o.draft);
   const next = o.draft.slice();
   if (o.fileId) {
-    const f = S.files.get(o.fileId);
+    const f = hostOf(o.fileId);
     const at = o.start, n = o.end - o.start + 1;
     if (!next.length) { removeSnippet(o, true); spliceFile(f, at, n, []); }
     else spliceFile(f, at, n, next);
     o.draft = null;
-    renderFile(f);
+    renderHost(f);
     for (const op of ops) if (op.t === '+') f.linesEl.children[at + op.b]?.classList.add('flash');
     hooks.onDirty?.();
+  } else if (o.type === 'file') {
+    setFileLines(o, next);
+    o.draft = null;
+    renderHost(o);
+    for (const op of ops) if (op.t === '+') o.linesEl.children[op.b]?.classList.add('flash');
+    hooks.onDirty?.();
   } else {
-    o.lines = next;
+    setFileLines(o, next);
     o.draft = null;
     renderSnippetCard(o);
   }
@@ -1334,9 +1517,9 @@ export function ctxItem(id) {
   if (f) return { kind: 'file', label: f.path, path: f.path, text: f.lines.join('\n') };
   const s = S.snippets.get(id);
   if (!s) return null;
-  if (s.fileId) { const hf = S.files.get(s.fileId); return { kind: 'snippet', label: s.title, path: hf.path, startLine: s.start + 1, text: snippetLines(s).join('\n') }; }
+  if (s.fileId) { const hf = hostOf(s.fileId); return { kind: 'snippet', label: s.title, path: hf.path || hf.target?.file, startLine: s.start + 1, text: snippetLines(s).join('\n') }; }
   const rs = refSource(s);
-  if (rs) return { kind: 'snippet', label: s.title, path: S.files.get(rs.fileId).path, startLine: rs.start + 1, text: snippetLines(rs).join('\n') };
+  if (rs) return { kind: 'snippet', label: s.title, path: hostOf(rs.fileId).path || undefined, startLine: rs.start + 1, text: snippetLines(rs).join('\n') };
   return { kind: 'snippet', label: s.title, path: s.target?.file, startLine: s.target?.replaceStart || s.target?.insertAt, text: s.lines.join('\n') };
 }
 export const ctxLines = id => (S.files.get(id)?.lines.length) ?? (S.snippets.has(id) ? snippetLines(S.snippets.get(id)).length : 0);
@@ -1370,7 +1553,7 @@ function removeFromCtx(id) {
 function markCtx(id) {
   const c = S.files.get(id) || S.snippets.get(id);
   c?.el?.classList.toggle('in-context', S.ctx.includes(id));
-  if (c?.fileId) renderRegions(S.files.get(c.fileId));
+  if (c?.fileId) renderRegions(hostOf(c.fileId));
 }
 export const globalContextItems = () => S.ctx.map(ctxItem).filter(Boolean);
 
@@ -1485,11 +1668,15 @@ export async function mergeSnippet(s, f, at, del = 0) {
   s.el.remove(); s.el = null;
   s._drawer?.el.remove(); s._draftUI?.el.remove();
   const lines = s.lines;
+  // the snippets marked inside it land on the same lines in the file
+  const riders = regionsOf(s);
+  riders.forEach(r => { r.fileId = null; });
   spliceFile(f, at, del, lines);
+  riders.forEach(r => Object.assign(r, { fileId: f.id, start: r.start + at, end: r.end + at }));
   Object.assign(s, { fileId: f.id, start: at, end: at + n - 1 });
   delete s.lines; delete s.x; delete s.y; delete s.w; delete s.pane;
   s.target = null;
-  renderFile(f);
+  renderHost(f);
   selectLanded(s);
   fadeInTabs(s);
   renderLinks();
@@ -1500,7 +1687,7 @@ export async function mergeSnippet(s, f, at, del = 0) {
 
 /** Lift an anchored region out of its file into a floating card at (x,y). copy=true leaves the file alone. */
 export async function detachRegion(s, x, y, copy = false) {
-  const f = S.files.get(s.fileId);
+  const f = hostOf(s.fileId);
   if (!f || S.animating) return;
   S.animating = true;
   if (!copy) pushUndo();
@@ -1514,20 +1701,20 @@ export async function detachRegion(s, x, y, copy = false) {
   await fly(htmls, src, dst, P);
   let fl;
   if (copy) {
-    fl = createFloating({ title: s.title + ' (copy)', lines, x, y, color: s.color, chat: s.chat.map(m => ({ ...m })), mode: s.mode, pane: P.id, lang: f.path });
-    renderFile(f);
+    fl = createFloating({ title: s.title + ' (copy)', lines, x, y, color: s.color, chat: s.chat.map(m => ({ ...m })), mode: s.mode, pane: P.id, lang: hostPath(f) });
+    renderHost(f);
   } else {
     const start = s.start;
     unlinkRefs(s);
     s.fileId = null;
     s._drawer?.el.remove(); s._draftUI?.el.remove();
     spliceFile(f, start, n, []);
-    Object.assign(s, { lines, x, y, pane: P.id, w: Math.max(340, Math.min(f.w, autoWidth(lines, 44))), target: null, lang: f.path });
+    Object.assign(s, { lines, x, y, pane: P.id, w: Math.max(340, Math.min(f.w, autoWidth(lines, 44))), target: null, lang: hostPath(f) });
     delete s.start; delete s.end;
     renderSnippetCard(s);
     mount(s);
     bringToFront(s);
-    renderFile(f);
+    renderHost(f);
     fl = s;
   }
   fl.el.animate([{ opacity: 0.4, transform: 'scale(.98)' }, { opacity: 1, transform: 'none' }], { duration: 200, easing: 'ease-out' });
@@ -1595,7 +1782,7 @@ function layoutLive(f) {
  * padded slot so it always has the same breathing room above and below.
  */
 function liveHover(pt, linesTop, alt, P, elTop) {
-  const f = live.lock || (live.src || !alt ? fileUnder(pt.x, pt.y, P) : null);
+  const f = live.lock || (live.src || !alt ? fileUnder(pt.x, pt.y, P, null, !!live.src) : null);
   let at = -1;
   if (f) {
     prepLive(f);
@@ -1636,7 +1823,7 @@ function finishLive() {
   for (const f of live.files) {
     f.el.classList.remove('live', 'drop-target');
     f.linesEl.style.height = '';
-    if (S.files.has(f.id)) renderFile(f);
+    if (hostOf(f.id)) renderHost(f);
   }
   if (live.ghost) { live.ghost.classList.remove('docked', 'docking', 'ref-ghost'); live.ghost.style.transform = ''; }
   live = null;
@@ -1662,7 +1849,7 @@ function slideInto(el, f, at, linesOff, gutterFrom) {
 
 /** After a drop: no flash, the snippet's tabs and region marker just fade in. */
 function fadeInTabs(s) {
-  const f = S.files.get(s.fileId);
+  const f = hostOf(s.fileId);
   f?.el.querySelectorAll(`.mtab[data-sid="${s.id}"], .region[data-sid="${s.id}"]`).forEach(e => e.classList.add('fade-in'));
 }
 
@@ -1690,7 +1877,7 @@ function makeGhost(s, f) {
  * like any other snippet drag, inside the file or out of it. Released without dragging, it is a plain Shift+click.
  */
 function startRegionDrag(e, s, via) {
-  const f = S.files.get(s.fileId);
+  const f = hostOf(s.fileId);
   if (!f) return;
   const P0 = paneOf(f);
   const p0 = toWorld(e.clientX, e.clientY, P0);
@@ -1766,7 +1953,7 @@ async function dropRegion(s, f, g) {
       s.fileId = null;
       s._drawer?.el.remove(); s._draftUI?.el.remove();
       spliceFile(f, start, n, []);
-      Object.assign(s, { lines, x: g.x, y: g.y, w: f.w, target: null, pane: g.P.id, lang: f.path });
+      Object.assign(s, { lines, x: g.x, y: g.y, w: f.w, target: null, pane: g.P.id, lang: hostPath(f) });
       delete s.start; delete s.end; delete s.origin;
       renderSnippetCard(s); mount(s); bringToFront(s);
       finishLive();
@@ -1786,7 +1973,7 @@ async function dropRegion(s, f, g) {
  * are shown as doomed while dragging and dissolved (their code stays) on release. A click just selects it.
  */
 function startRegionResize(e, s, edge) {
-  const f = S.files.get(s.fileId);
+  const f = hostOf(s.fileId);
   if (!f || S.animating || live) return;
   const orig = { start: s.start, end: s.end };
   let moved = false, victims = [];
@@ -1913,7 +2100,7 @@ async function dropSnippet(s, f, at, linesOff, origPos) {
 }
 
 // ---------- references: a card that mirrors lines still living in a file ----------
-function refSource(s) { const r = s?.ref && S.snippets.get(s.ref); return r && r.fileId && S.files.has(r.fileId) ? r : null; }
+function refSource(s) { const r = s?.ref && S.snippets.get(s.ref); return r && r.fileId && !!hostOf(r.fileId) ? r : null; }
 function isReferenced(s) { for (const x of S.snippets.values()) if (x.ref === s.id) return true; return false; }
 function refreshRefs(f) { for (const x of S.snippets.values()) { const r = refSource(x); if (r && r.fileId === f.id && x.el) renderSnippetCard(x); } }
 function materializeRef(s) {
@@ -1921,10 +2108,10 @@ function materializeRef(s) {
   if (!r) return;
   s.lines = snippetLines(r).slice();
   delete s.ref;
-  renderRegions(S.files.get(r.fileId));
+  renderRegions(hostOf(r.fileId));
 }
 export function makeReference(s, x, y, P) {
-  const f = S.files.get(s.fileId);
+  const f = hostOf(s.fileId);
   const r = createFloating({ title: s.title, lines: snippetLines(s), ref: s.id, x, y, w: f.w, color: s.color, pane: (P || paneOf(f)).id });
   renderRegions(f);
   r.el.animate([{ opacity: 0.3 }, { opacity: 1 }], { duration: 200 });
@@ -1949,7 +2136,7 @@ export async function applyToTarget(s) {
 // =====================================================================
 export function spawnDrafts(drafts, near) {
   const ids = [];
-  const nearCard = near && (near.fileId ? S.files.get(near.fileId) : near);
+  const nearCard = near && (near.fileId ? hostOf(near.fileId) : near);
   let k = 0;
   for (const d of drafts) {
     const lines = d.code.replace(/\n$/, '').split('\n');
@@ -2060,7 +2247,7 @@ function enterEdit(c, line = 0) {
   if (S.editing) exitEdit();
   const rsrc = refSource(c);
   if (rsrc) c = rsrc;
-  if (c.fileId) { const f = S.files.get(c.fileId); line = c.start; c = f; }
+  if (c.fileId) { const f = hostOf(c.fileId); line = c.start; c = f; }
   S.editing = c;
   hideSelTools();
   c.el.classList.add('editing');
@@ -2076,10 +2263,16 @@ function enterEdit(c, line = 0) {
     hlRaf = 0;
     hlEl.innerHTML = highlightLines(ta.value.split('\n'), path).map(x => `<div class="ed-ln">${x || ' '}</div>`).join('');
   };
+  let pillRaf = 0;
+  const pills = () => { if (!pillRaf) pillRaf = requestAnimationFrame(() => { pillRaf = 0; if (S.editing === c) paintPillars(c); }); };
   const sync = () => {
-    const n = ta.value.split('\n').length;
+    const ls = ta.value.split('\n');
+    const n = ls.length;
     gut.textContent = Array.from({ length: n }, (_, i) => i + 1).join('\n');
     ta.style.height = n * LH + 'px';
+    // as wide as the widest line, so the caret never scrolls the text sideways; the card clips it
+    ta.style.minWidth = ls.reduce((m, l) => Math.max(m, visLen(l)), 0) * charW + 24 + 'px';
+    pills();
     if (n <= 3000) paintHl(); // colours keep up keystroke-for-keystroke
     else if (!hlRaf) hlRaf = requestAnimationFrame(paintHl);
   };
@@ -2091,8 +2284,9 @@ function enterEdit(c, line = 0) {
   c.linesEl.style.display = 'none';
   if (c.regionsEl) c.regionsEl.style.display = 'none';
   c.bodyEl.prepend(wrap);
-  c._editor = { wrap, ta };
+  c._editor = { wrap, ta, hlEl };
   ta.addEventListener('input', sync);
+  for (const ev of ['keyup', 'pointerup', 'select']) ta.addEventListener(ev, pills);
   ta.addEventListener('pointerdown', e => e.stopPropagation());
   ta.addEventListener('keydown', e => {
     e.stopPropagation();
@@ -2116,12 +2310,15 @@ function enterEdit(c, line = 0) {
   const off = lines.slice(0, line).reduce((n, l) => n + l.length + 1, 0);
   ta.setSelectionRange(off, off);
   resetNativeScroll();
+  stickHeader(c);
+  pills();
 }
 
 export function exitEdit() {
   const c = S.editing;
   if (!c) return;
   S.editing = null;
+  stickHeader(c);
   const next = c._editor.ta.value.split('\n');
   c._editor.wrap.remove();
   c._editor = null;
@@ -2131,10 +2328,10 @@ export function exitEdit() {
   if (c.type === 'file') {
     const before = snapshot();
     if (setFileLines(c, next)) { S.undo.push(before); S.redo = []; }
-    renderFile(c);
+    renderHost(c);
     hooks.onDirty?.();
   } else {
-    if (next.join('\n') !== c.lines.join('\n')) { pushUndo(); c.lines = next; }
+    if (next.join('\n') !== c.lines.join('\n')) { pushUndo(); if (c.ref) c.lines = next; else setFileLines(c, next); }
     renderSnippetCard(c);
   }
   renderLinks();
@@ -2160,9 +2357,9 @@ function cardFromEl(el) {
   return S.files.get(id) || S.snippets.get(id);
 }
 
-function fileUnder(wx, wy, P, exclude) {
+function fileUnder(wx, wy, P, exclude, snippets) {
   let best = null, bz = -1;
-  for (const f of S.files.values()) {
+  for (const f of snippets ? allCards().filter(c => c.type === 'file' || (ownLines(c) && c.el)) : S.files.values()) {
     if (f === exclude || !inPane(f, P)) continue;
     if (wx >= f.x && wx <= f.x + f.w && wy >= f.y && wy <= f.y + cardH(f)) {
       const z = +f.el.style.zIndex || 0;
@@ -2248,7 +2445,8 @@ function onPointerDown(e, P) {
   bringToFront(card);
   if (S.editing === card) return;
 
-  if (t.closest('.resize')) { startResize(e, card); return; }
+  if (t.closest('.resize') || t.closest('.edge-r')) { startResize(e, card); return; }
+  if (t.closest('.edge-l')) { startResize(e, card, true); return; }
   const rbar = t.closest('.rbar');
   if (rbar) {
     const s = S.snippets.get(rbar.closest('.region').dataset.sid);
@@ -2260,7 +2458,8 @@ function onPointerDown(e, P) {
 
   const mod = e.ctrlKey || e.metaKey || e.shiftKey;
   const inHead = t.closest('.card-head');
-  if (card.type === 'file' && !inHead && t.closest('.lines')) {
+  // files and snippets alike: drag selects lines, Shift+drag moves them; the header (or Space) moves the card
+  if ((card.type === 'file' || ownLines(card)) && !inHead && t.closest('.lines')) {
     const sr = selRange(card);
     if (e.shiftKey && sr) {
       const line = lineAt(card, e.clientY);
@@ -2344,11 +2543,16 @@ function startMarquee(e, P) {
   }, () => { P.marquee.style.display = 'none'; });
 }
 
-function startResize(e, c) {
+/** Width from the right edge or the corner; from the left edge (`left`) the card's left side moves instead. */
+function startResize(e, c, left) {
   e.preventDefault();
-  const sx = e.clientX, ow = c.w, z = paneOf(c).view.z;
-  drag = { kind: 'resize', cancel: () => { c.w = ow; positionCard(c); renderLinks(); } };
-  drag.abort = capture(e, ev => { c.w = Math.max(240, ow + (ev.clientX - sx) / z); positionCard(c); renderLinks(); }, () => scheduleSave());
+  const sx = e.clientX, ow = c.w, ox = c.x, z = paneOf(c).view.z;
+  drag = { kind: 'resize', cancel: () => { c.w = ow; c.x = ox; positionCard(c); renderLinks(); renderHost(c); } };
+  drag.abort = capture(e, ev => {
+    const d = (ev.clientX - sx) / z;
+    if (left) { c.w = Math.max(240, ow - d); c.x = ox + ow - c.w; } else c.w = Math.max(240, ow + d);
+    positionCard(c); markWide(c); renderLinks();
+  }, () => { renderHost(c); scheduleSave(); });
 }
 
 function startLineSelect(e, f) {
@@ -2445,6 +2649,7 @@ function hideIndicators(f) { if (!f?.dropEl) return; f.dropEl.style.display = 'n
 function onHoverMove(e) {
   if (!e) return;
   lastPointer = e;
+  peekAt(e);
   if (!S.pick) return;
   const P = paneAt(e.clientX, e.clientY);
   if (!P) return;
@@ -2549,7 +2754,7 @@ function showMenu(e, items) {
 function hideMenu() { if (menuEl) menuEl.style.display = 'none'; }
 
 function regionMenu(s) {
-  const f = S.files.get(s.fileId);
+  const f = hostOf(s.fileId);
   return [
     { header: s.title },
     { label: s.drawerOpen ? 'Hide chat' : 'Open chat', fn: () => toggleDrawer(s) },
@@ -2564,7 +2769,7 @@ function regionMenu(s) {
     '-',
     { label: 'Dissolve snippet (keep code)', fn: () => { pushUndo(); removeSnippet(s); } },
     { label: 'Dissolve all snippets in this file', fn: () => dissolveAll(f) },
-    { label: 'Delete snippet and its lines', fn: () => { pushUndo(); const n = s.end - s.start + 1, a = s.start; removeSnippet(s); spliceFile(f, a, n, []); renderFile(f); hooks.onDirty?.(); } },
+    { label: 'Delete snippet and its lines', fn: () => { pushUndo(); const n = s.end - s.start + 1, a = s.start; removeSnippet(s); spliceFile(f, a, n, []); renderHost(f); hooks.onDirty?.(); } },
   ];
 }
 
@@ -2609,6 +2814,7 @@ function onContextMenu(e, P) {
     }
     items.push({ header: basename(f.path) },
       { label: f.drawerOpen ? 'Hide file chat' : 'Chat about this file', fn: () => toggleDrawer(f) },
+      { label: f.draftOpen ? 'Hide draft' : 'Draft changes to this file', fn: () => toggleDraft(f) },
       { label: 'Explain file', fn: () => explainFile(f.path) },
       { label: 'Dissolve all snippets in this file', disabled: !regionsOf(f).length, fn: () => dissolveAll(f) },
       { label: S.ctx.includes(f.id) ? 'Remove from context' : 'Add file to context', fn: () => toggleCtx(f.id) },
@@ -2618,6 +2824,14 @@ function onContextMenu(e, P) {
       { label: 'Close', fn: () => closeFile(f) });
   } else if (card?.type === 'snippet' && !selSnips.includes(card)) {
     const s = card;
+    const sel = ownLines(s) && selRange(s);
+    if (sel) {
+      items.push({ header: `Lines ${sel.a + 1}–${sel.b + 1}` },
+        { label: 'Create snippet from selection', fn: () => makeSnippetFromSel(s) },
+        { label: 'Detach selection as snippet', fn: () => { const x = makeSnippetFromSel(s); detachRegion(x, s.x + s.w + 80, s.y + BODY_TOP + sel.a * LH); } },
+        { label: 'Copy selection out', fn: () => copyOut(s, sel) },
+        { label: 'Ask the LLM about selection', fn: () => { const x = makeSnippetFromSel(s); openDrawer(x, true); } }, '-');
+    }
     items.push({ header: s.title },
       { label: 'Merge into…', key: 'pick a line', fn: () => startPick([s], null) },
       s.target?.file ? { label: `Apply to ${basename(s.target.file)}`, fn: () => applyToTarget(s) } : null,
@@ -2710,11 +2924,11 @@ function setCardLines(c, changed) {
   if (!changed.length) return;
   pushUndo();
   const src = c.type === 'file' ? null : refSource(c);
-  const f = c.type === 'file' ? c : src ? S.files.get(src.fileId) : null;
+  const f = c.type === 'file' ? c : src ? hostOf(src.fileId) : null;
   if (f) {
     const base = src ? src.start : 0;
     for (const [line, text] of changed) spliceFile(f, base + line, 1, [text]); // line by line, so snippets stay attached
-    renderFile(f);
+    renderHost(f);
   } else {
     for (const [line, text] of changed) c.lines[line] = text;
     renderSnippetCard(c);
@@ -2797,7 +3011,7 @@ function openFindHere(replace) {
   let c = null, within = null;
   if (ids.length === 1) {
     c = S.files.get(ids[0]) || S.snippets.get(ids[0]);
-    if (c?.fileId) { within = [c.start, c.end]; c = S.files.get(c.fileId); }
+    if (c?.fileId) { within = [c.start, c.end]; c = hostOf(c.fileId); }
   }
   if (!c && lastPointer) c = cardFromEl(document.elementFromPoint(lastPointer.clientX, lastPointer.clientY) || root);
   if (!c) { toast('Select a file or snippet (or point at one) to search in it.'); return; }
@@ -2987,11 +3201,12 @@ export function arrange(files, P = AP()) {
 // =====================================================================
 function plainSnippet(s) {
   const o = {};
-  for (const [k, v] of Object.entries(s)) if (!k.startsWith('_') && k !== 'el' && k !== 'linesEl' && k !== 'bodyEl') o[k] = v;
+  for (const [k, v] of Object.entries(s)) if (!k.startsWith('_') && !k.endsWith('El') && k !== 'el') o[k] = v;
   return o;
 }
 const plainFile = (f, withLines) => ({
   id: f.id, path: f.path, pane: f.pane, x: f.x, y: f.y, w: f.w, chat: f.chat, mode: f.mode, drawerOpen: f.drawerOpen,
+  draft: f.draft || undefined, draftOpen: f.draftOpen || undefined, wide: f.wide || undefined,
   ...(withLines ? { lines: f.lines, saved: f.saved, eol: f.eol } : { lines: isDirty(f) ? f.lines : undefined }),
 });
 function snapshot() {
@@ -3015,7 +3230,7 @@ function restoreSnap(json) {
   for (const f of d.files) S.files.set(f.id, { ...f, type: 'file', sel: null, chat: f.chat || [] });
   for (const s of d.snippets) S.snippets.set(s.id, s);
   S.ctx = d.ctx.filter(id => S.files.has(id) || S.snippets.has(id));
-  for (const f of S.files.values()) { renderFile(f); mount(f); }
+  for (const f of S.files.values()) { renderHost(f); mount(f); }
   for (const s of S.snippets.values()) if (!s.fileId) { renderSnippetCard(s); mount(s); }
   renderLinks();
   hooks.onFilesChanged?.(); hooks.onContext?.(); hooks.onDirty?.();
@@ -3076,12 +3291,14 @@ export async function restoreSaved(st) {
     id: f.id, w: f.w, lines: f.lines, silent: true, pane: f.pane, chat: f.chat, mode: f.mode, drawerOpen: f.drawerOpen,
   })));
   const ok = new Set(results.filter(Boolean).map(f => f.id));
-  for (const s of st.snippets || []) {
-    if (s.fileId) {
-      const f = S.files.get(s.fileId);
-      if (!ok.has(s.fileId) || !f || s.start >= f.lines.length) continue;
-      s.end = Math.min(s.end, f.lines.length - 1);
-    }
+  for (const f of st.files || []) { const c = S.files.get(f.id); if (c) Object.assign(c, { draft: f.draft, draftOpen: !!f.draftOpen, wide: !!f.wide }); }
+  const list = st.snippets || [];
+  for (const s of list) if (!s.fileId) S.snippets.set(s.id, s);
+  for (const s of list) {
+    if (!s.fileId) continue;
+    const f = hostOf(s.fileId);
+    if (!f || (f.type === 'file' && !ok.has(s.fileId)) || s.start >= (f.lines || []).length) continue;
+    s.end = Math.min(s.end, f.lines.length - 1);
     S.snippets.set(s.id, s);
   }
   for (const s of S.snippets.values()) if (!s.fileId) { renderSnippetCard(s); mount(s); }

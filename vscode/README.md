@@ -39,6 +39,10 @@ To install it permanently, run `npm run package` and install the generated `.vsi
 - **Merge:** drag a floating snippet onto a file. The lines part to make room as you move it, and it slots in on release. You can also Ctrl/Shift-select snippets and a file, then right-click → **Merge into …**.
 - **Edit:** double-click a file or snippet. Double-clicking a snippet that sits in a file edits the whole file. Esc finishes, Ctrl+S saves to disk. Regions stay attached to their lines through edits.
 - **New blank snippet:** double-click empty canvas.
+- **Snippets inside snippets:** a floating snippet's lines select like a file's (drag across them, Shift+drag to move them), and the toolbar can mark a snippet inside it, with its own bar, chat and draft. It moves with its lines and goes along when the snippet is merged into a file.
+- **Lines wider than the card** end in a fade with a bright edge. Hover one to see the rest of it sticking out of the card's right side. While editing, every wide line shows that way (click in it to put the caret there). The ⇥ button in the header, shown when a card has wide lines, keeps them all showing.
+- **Resize:** drag a card's left or right edge, or its bottom-right corner.
+- **While editing,** the card's header (and find bar) stays at the top of the view when you scroll down a long card.
 
 ## Split views
 
@@ -47,7 +51,7 @@ Use the split buttons in the top bar, a view's hover bar (top-left), right-click
 ## Drafts and file chats
 
 - **Drafts:** every snippet has a **✎ Draft** tab under its chat tab. The draft starts as a copy of the snippet, and any changes show as a git-style diff. Edit it directly, or type a request in the box at the bottom. When the snippet's chat suggests a change, it lands in the draft, and **Apply** writes it into the snippet (and its file).
-- **File chats:** files have their own **Chat** tab in the top-right corner (or the chat icon in the header), with *File* / *Global* context.
+- **File chats:** files have their own **Chat** tab in the top-right corner (or the chat icon in the header), with *File* / *Global* context. Changes the chat suggests for the file's own lines are combined into the file's **✎ Draft** (right-click a file → *Draft changes to this file* to start one by hand); long unchanged stretches fold away.
 - **Resetting a chat:** every chat has a ↺ button that resets it.
 
 ## Find and replace

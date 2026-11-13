@@ -2,7 +2,7 @@
   "name": "codecanvas",
   "displayName": "CodeCanvas",
   "description": "An infinite canvas for your code: lay out files, carve them into snippets, draft snippets with local or cloud LLMs, and merge them back line-by-line.",
-  "version": "0.7.5",
+  "version": "0.7.6",
   "publisher": "codecanvas",
   "license": "MIT",
   "engines": {

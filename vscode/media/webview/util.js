@@ -42,6 +42,7 @@ export const nextColor = () => SNIPPET_COLORS[_c++ % SNIPPET_COLORS.length];
 // ---------- icons (inline svg, stroke = currentColor) ----------
 const I = d => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${d}</svg>`;
 export const icons = {
+  wide: I('<path d="M3 6h11M3 12h18M3 18h11M18 9l3 3-3 3"/><path d="M16 3v18" stroke-dasharray="2 2"/>'),
   close: I('<path d="M6 6l12 12M18 6L6 18"/>'),
   ctx: I('<circle cx="12" cy="12" r="3"/><circle cx="12" cy="12" r="8"/>'),
   explain: I('<path d="M9.1 9a3 3 0 1 1 3.9 2.9c-.6.2-1 .8-1 1.4V14"/><circle cx="12" cy="17.5" r=".6"/><circle cx="12" cy="12" r="10"/>'),
