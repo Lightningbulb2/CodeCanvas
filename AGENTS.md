@@ -121,6 +121,19 @@ Reference points on a 1920×1080 canvas with nine overlapping files: about 16.2 
 pan, scroll and zoom with no frames over 20 ms; main thread about 2–3 ms per frame when panning, 5–11 ms while
 a zoom glides; RSS about 300 MB.
 
+## Releasing the VS Code extension
+
+`.github/workflows/vscode.yml` builds and packages the extension on every push or pull request that touches
+`vscode/` (the `.vsix` is kept as a workflow artifact). To publish a release:
+
+1. Bump `version` in `vscode/package.json` and commit.
+2. Tag that commit with an annotated tag named `vscode-v<version>`, whose message is the release notes:
+   `git tag -a vscode-v0.7.7 -F notes.txt`.
+3. Push the commit, then the tag: `git push origin main vscode-v0.7.7`.
+
+The workflow checks that the tag matches the version, then creates the GitHub release with the `.vsix`
+attached. Locally, `npm run package` (in `vscode/`) builds the same file.
+
 ## Packaging
 
 Both are packaged for Guix in hyperguix as `codecanvas` and `codecanvas-vscode` (plus
