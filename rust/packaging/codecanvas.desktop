@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=CodeCanvas
+GenericName=Code Canvas
+Comment=Infinite canvas for source code
+Exec=codecanvas %f
+Icon=codecanvas
+Terminal=false
+StartupNotify=true
+StartupWMClass=codecanvas
+Categories=Development;IDE;
+Keywords=code;canvas;snippet;editor;
+MimeType=inode/directory;

@@ -1,0 +1,20 @@
+[package]
+name = "codecanvas"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "CodeCanvas: an infinite canvas for code, built on GPUI."
+
+[dependencies]
+gpui = "0.2.2"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+regex = "1"
+ureq = { version = "2", features = ["json"] }
+# Both are already in the dependency tree through gpui; the tile cache in src/ui/tiles.rs uses them directly.
+cosmic-text = "0.14"
+image = { version = "0.25", default-features = false }
+
+# gpui 0.2.2 pulls in xattr 0.2.3, which no longer builds on Linux against current libc.
+[patch.crates-io]
+xattr = { path = "patches/xattr" }
