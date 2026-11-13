@@ -1,0 +1,27 @@
+# Builds the bridge the extension downloads. The Linux build is static (musl), so it also runs on Guix System.
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, asset: codecanvas-zed-bridge-linux-x86_64, exe: codecanvas-zed-bridge }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, asset: codecanvas-zed-bridge-windows-x86_64.exe, exe: codecanvas-zed-bridge.exe }
+          - { os: macos-latest, target: aarch64-apple-darwin, asset: codecanvas-zed-bridge-macos-aarch64, exe: codecanvas-zed-bridge }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add ${{ matrix.target }}
+      - if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get install -y musl-tools
+      - run: cargo build --release --target ${{ matrix.target }} --manifest-path bridge/Cargo.toml
+      - shell: bash
+        run: cp bridge/target/${{ matrix.target }}/release/${{ matrix.exe }} ${{ matrix.asset }}
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset }}
