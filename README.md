@@ -13,6 +13,9 @@ can have its own chat with a language model.
 Each directory is a project of its own, with its own README, build and
 license file.
 
-On Guix, both are packaged in the
+On Guix, all three are packaged in the
 [hyperguix](https://github.com/Lightningbulb2/hyperguix) channel as
 `codecanvas`, `codecanvas-vscode` and `codecanvas-zed-bridge`.
+
+Working on the code: [ARCHITECTURE.md](ARCHITECTURE.md) explains how the app and the VS Code extension are
+built, and [AGENTS.md](AGENTS.md) has the rules, build and test commands, and how to measure.

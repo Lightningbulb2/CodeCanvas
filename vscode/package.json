@@ -5,6 +5,13 @@
   "version": "0.7.6",
   "publisher": "codecanvas",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Lightningbulb2/CodeCanvas.git",
+    "directory": "vscode"
+  },
+  "homepage": "https://github.com/Lightningbulb2/CodeCanvas/tree/main/vscode",
+  "bugs": "https://github.com/Lightningbulb2/CodeCanvas/issues",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -147,11 +154,12 @@
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "package": "npx @vscode/vsce package --allow-missing-repository"
+    "package": "vsce package --baseContentUrl https://github.com/Lightningbulb2/CodeCanvas/blob/main/vscode --baseImagesUrl https://github.com/Lightningbulb2/CodeCanvas/raw/main/vscode"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.9.2",
     "typescript": "^5.4.0"
   }
 }
