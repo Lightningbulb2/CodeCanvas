@@ -8,10 +8,11 @@ can have its own chat with a language model.
 |---|---|
 | [`rust/`](rust) | The desktop app, a native binary built on GPUI (Zed's UI framework) |
 | [`vscode/`](vscode) | The extension for VS Code and VSCodium |
+| [`zed/`](zed) | The extension for Zed, and the bridge program (`zed/bridge`) that connects Zed to the app |
 
 Each directory is a project of its own, with its own README, build and
 license file.
 
 On Guix, both are packaged in the
 [hyperguix](https://github.com/Lightningbulb2/hyperguix) channel as
-`codecanvas` and `codecanvas-vscode`.
+`codecanvas`, `codecanvas-vscode` and `codecanvas-zed-bridge`.

@@ -12,7 +12,7 @@ The first time it changes an existing `tasks.json` or `keymap.json` it saves a `
 
 ## The app it launches
 
-Whichever `codecanvas` it finds: the [CodeCanvas desktop app](https://github.com/Lightningbulb2/CodeCanvas), written in Rust on GPUI.
+Whichever `codecanvas` it finds: the [CodeCanvas desktop app](../rust), written in Rust on GPUI.
 
 ## Settings
 
@@ -33,6 +33,6 @@ On Guix System the downloaded Linux bridge is fully static, so it runs as is. `b
 
 ## Publishing
 
-Pushing a `v*` tag makes GitHub Actions build the bridge and attach it to a release, which is where the extension downloads it from. Until a release exists, install the extension with Zed's `zed: install dev extension` and set `bridge_path` to a local build (`cargo build --release --manifest-path bridge/Cargo.toml`).
+Pushing a `zed-v*` tag makes GitHub Actions build the bridge and attach it to a release, which is where the extension downloads it from. Until a release exists, install the extension with Zed's `zed: install dev extension` and set `bridge_path` to a local build (`cargo build --release --manifest-path zed/bridge/Cargo.toml` from the repository root).
 
 Zed's docs say MCP server extensions are being deprecated in favour of the official MCP registry, so this mechanism may need revisiting.

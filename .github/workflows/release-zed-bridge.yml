@@ -1,8 +1,8 @@
 # Builds the bridge the extension downloads. The Linux build is static (musl), so it also runs on Guix System.
-name: release
+name: Release the Zed bridge
 on:
   push:
-    tags: ["v*"]
+    tags: ["zed-v*"]
 permissions:
   contents: write
 jobs:
@@ -19,9 +19,9 @@ jobs:
       - run: rustup target add ${{ matrix.target }}
       - if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get install -y musl-tools
-      - run: cargo build --release --target ${{ matrix.target }} --manifest-path bridge/Cargo.toml
+      - run: cargo build --release --target ${{ matrix.target }} --manifest-path zed/bridge/Cargo.toml
       - shell: bash
-        run: cp bridge/target/${{ matrix.target }}/release/${{ matrix.exe }} ${{ matrix.asset }}
+        run: cp zed/bridge/target/${{ matrix.target }}/release/${{ matrix.exe }} ${{ matrix.asset }}
       - uses: softprops/action-gh-release@v2
         with:
           files: ${{ matrix.asset }}

@@ -1,12 +1,12 @@
 # CodeCanvas (Rust / GPUI)
 
-An infinite canvas for your code, built on GPUI, Zed's UI framework. A single native binary with no bundled browser, which is what makes it practical to package on Guix System. It's the desktop app of the CodeCanvas family, alongside [the VS Code extension](../vscode) and [CodeCanvas-zed](https://github.com/Lightningbulb2/CodeCanvas-zed).
+An infinite canvas for your code, built on GPUI, Zed's UI framework. A single native binary with no bundled browser, which is what makes it practical to package on Guix System. It's the desktop app of the CodeCanvas family, alongside [the VS Code extension](../vscode) and [the Zed extension](../zed).
 
 ```bash
 cargo run --release -- [folder] [file]
 ```
 
-Launching again while a project is open shows it in the running window; the launcher returns immediately, so Zed tasks don't wait on it. Use the [CodeCanvas-zed](https://github.com/Lightningbulb2/CodeCanvas-zed) extension to connect it to Zed.
+Launching again while a project is open shows it in the running window; the launcher returns immediately, so Zed tasks don't wait on it. Use the [the Zed extension](../zed) extension to connect it to Zed.
 
 ## Controls
 

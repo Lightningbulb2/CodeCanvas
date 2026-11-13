@@ -5,7 +5,7 @@ use serde::Deserialize;
 use std::fs;
 use zed_extension_api::{self as zed, settings::ContextServerSettings, ContextServerId, Project, Result};
 
-const REPO: &str = "Lightningbulb2/CodeCanvas-zed";
+const REPO: &str = "Lightningbulb2/CodeCanvas";
 
 #[derive(Default, Deserialize)]
 struct Settings {
