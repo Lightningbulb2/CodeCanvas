@@ -15,3 +15,6 @@ license file.
 On Guix, both are packaged in the
 [hyperguix](https://github.com/Lightningbulb2/hyperguix) channel as
 `codecanvas` and `codecanvas-vscode`.
+
+Working on the code: [ARCHITECTURE.md](ARCHITECTURE.md) explains how both are built, and
+[AGENTS.md](AGENTS.md) has the rules, build and test commands, and how to measure.

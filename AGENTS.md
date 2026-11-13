@@ -79,109 +79,31 @@ python3 -m http.server 8765 --directory vscode
 - The mock host answers a chat message starting with `Revise` with a snippet revision, one starting with
   `Change this file` with two line changes for that file, and anything else with a new snippet.
 
-## The model (both versions)
+## How it is built
 
-- **Card:** a file (has a path, its lines, and what is on disk) or a floating snippet (its own lines).
-- **Region ("snippet in a file"):** a line range `start..=end` marked inside a host card. The host is
-  usually a file, but **a floating snippet can host regions too.** Regions follow their lines through every
-  edit: all changes to a card's lines go through a splice that shifts, grows, shrinks or drops regions
-  (`Doc::splice` / `set_file_lines` in Rust, `spliceFile` / `setFileLines` in JS). Never assign a card's
-  lines directly if it may hold regions.
-- **Reference:** a floating card that mirrors a region's lines (`ref_of` / `ref`); edits go to the source.
-- **Merging** a floating snippet into a file turns it into a region of that file; regions inside it move
-  along with the same offsets. Removing a card removes the regions it hosts.
-- **Talk:** every file, snippet and region has a chat and a **draft**. The draft is an editable copy shown
-  as a diff against the current lines; *Apply* writes it back through the splice. Files get drafts too.
-- **Context list:** cards and regions the user adds; *Global* chat mode sends them with the question.
+Read [ARCHITECTURE.md](ARCHITECTURE.md) before changing anything non-trivial: the shared model, the LLM
+protocol, each app's threads, frame and drawing pipeline, and a table of where each feature lives in both
+versions (use it to port a change).
 
-### LLM reply protocol
+### Don't break these
 
-The model proposes code as fenced blocks, parsed on both sides:
+Each of these was measured or fixed a visible bug; keep them unless you measure something better.
 
-````
-```snippet file="relative/path" replace="A-B" title="Short title"
-...code...
-```
-````
-
-`insert="N"` inserts before line N; `replace="A-B"` replaces lines A..B (inclusive, 1-based). Routing:
-
-- In a **snippet's** chat, the block revising that snippet becomes its draft; others become cards.
-- In a **file's** chat, every block with `file=` that file is applied to the file's draft, in the file's
-  numbering before any change (applied bottom-up; a block with neither attribute is the whole new file).
-  See `file_draft` (Rust, tested) and `fileDraft` (JS).
-- Anything else becomes a floating card near the chat, with a dashed link to its suggested place.
-
-Tools the model can call in the plain-text tool loop: `<read path="…"/>` (project files only) and
-`<search query="…"/>` (needs a SearXNG URL). See `rust/src/agent.rs` and `vscode/src/agent.ts`.
-
-## rust/ architecture
-
-| File | What |
-|---|---|
-| `main.rs` | Single instance (a second launch hands its folder to the running window), detached relaunch with `--cc-child`, `mallopt` tuning, window options (`app_id` `codecanvas`) |
-| `model.rs` | `Doc`, `Card`, `Region`, `Talk`, drafts, context, splice, saving and loading (tests here) |
-| `agent.rs`, `llm.rs`, `web.rs` | Prompts and the snippet protocol, providers (llama.cpp, Ollama, OpenAI-compatible, Anthropic), SearXNG |
-| `text.rs`, `highlight.rs`, `diff.rs` | Editor buffer, compact syntax spans, line diff |
-| `ui/mod.rs` | `CanvasView` state, input, drags (`enum Drag`), live drag-and-drop, chats, file drafts |
-| `ui/render.rs` | Drawing: cards, text lines, cells, overflow pillars, tabs, dot grid, cached views |
-| `ui/tiles.rs` | Text cell cache: worker rasterisers and the cell format |
-| `ui/panels.rs`, `ui/find.rs`, `ui/fx.rs` | Top bar, explorer, chat panel, menus; find/replace; animations and icons |
-
-State lives in `$XDG_STATE_HOME/codecanvas/projects/<hash>.json` (file text that matches disk is left out
-and re-read on load), settings and the API key in `$XDG_CONFIG_HOME/codecanvas`.
-
-### How text is drawn, and the rules that keep it fast and steady
-
-GPUI rebuilds the element tree every frame, so per-frame work is what matters. The pieces below were each
-measured; keep them unless you measure something better.
-
-- **Text cells.** At rest and while panning, code is drawn from cached bitmaps: 256×256 device-pixel cells
-  per (view, card, zoom, column, row), rasterised by worker threads with cosmic-text/swash using only the code
-  font's two faces. All cells are the same size because GPUI's upload staging buffers are reused only for
-  uploads of equal or smaller size.
-- **Cells must match directly drawn glyphs pixel for pixel**, so switching between them is invisible: same
-  quarter-pixel glyph size (`code_px`), quarter-pixel horizontal offsets, whole-pixel baselines computed the
-  same way, the platform descent taken as a positive distance, and GPUI's glyph gamma (1.8) and contrast
-  correction applied to coverage (`glyph_alpha`). If you change one path, change the other.
-- **While a zoom glides**, lines are drawn as real glyphs at each frame's size (stretched bitmaps look dim
-  and soft). Cells for the zoom being landed on are requested once the target has held for a few frames, so
-  they are ready when the glide stops.
-- **Zoom levels** from the wheel, keys and Fit are snapped so a line is a whole number of pixels tall; card
-  origins are rounded to whole pixels.
-- **One draw order per card's text** (`window.paint_layer`): GPUI's scene otherwise searches its bounds tree
-  for every glyph, which is very slow where cards overlap.
-- **Occlusion:** lines fully covered by opaque cards drawn above are neither drawn nor cached.
-- **Cell budget:** about four screens; least recently used cells go first, never one drawn in the last two
-  frames (dropping visible cells makes text flicker between cells and glyphs). Finished cells nobody wants
-  any more are dropped before upload; uploads are capped per frame.
-- **Cached views:** the chat panel, top bar, explorer and context list are `AnyView::cached` entities that
-  redraw only when a fingerprint of what they show changes (`chat_key`, `chrome_key`). If something a panel
-  shows can change, include it in the fingerprint, or the panel goes stale. A cached view notified during a
-  draw also needs another frame (`fx.want_frame = true`).
-- **Dot grid:** one quad per dot at its exact canvas position (snapped per dot), in one layer. Rounding the
-  spacing instead makes the dots slide against the cards while zooming.
-- **Memory:** lines are shared `Arc`s, chat text is `Arc<str>`, spans are compact, the UI font is one that
-  doesn't make GPUI load dozens of faces, and glibc's arenas and trim threshold are tuned in `main.rs`.
-- The pump runs at 33 ms only while something is moving or streaming, otherwise 250 ms.
-
-## vscode/ architecture
-
-| File | What |
-|---|---|
-| `src/extension.ts`, `src/canvasPanel.ts` | Commands, the webview panel or window, file access, state (`workspaceState` key `codecanvas.state.v1`) |
-| `src/agent.ts`, `src/llm.ts`, `src/web.ts` | Prompts and tool loop, providers, SearXNG (same behaviour as the Rust files) |
-| `media/webview/canvas.js` | The canvas: model (`S.files`, `S.snippets`), rendering, drags, regions, drafts, find, persistence |
-| `media/webview/main.js`, `chat.js`, `util.js`, `bridge.js` | Top bar and panels, chat UI, helpers and highlighter, host messaging |
-
-- The view is a CSS transform on the world element; the browser does the zooming, so text stays sharp.
-- Regions are entries in `S.snippets` with `fileId` naming their host; look hosts up with `hostOf(id)` (a
-  file or a floating snippet), name their language with `hostPath(card)`, and redraw with `renderHost(card)`.
-- Off-screen lines use `content-visibility: auto`; far-zoom labels get `--inv-z` on the labels only (on the
-  world it restyles every line each frame).
-- Wide lines: `.ln.wide` draws the fade; pillars are absolutely placed in the card, positioned from inside
-  its border. While editing, the textarea is as wide as its widest line so it never scrolls sideways.
-- Saved snippets are plain copies of the objects minus keys starting with `_` or ending in `El` (DOM).
+- **Every change to a card's lines goes through the splice** (`Doc::splice` / `set_file_lines`,
+  `spliceFile` / `setFileLines`), so regions stay on their lines. Never assign a card's lines directly.
+- **Rust: cells and directly drawn glyphs must match pixel for pixel**: same `code_px` size, quarter-pixel
+  offsets, baseline formula and glyph gamma/contrast (`glyph_alpha`). Change one path, change the other,
+  and compare screenshots.
+- **Rust: zoom levels stay whole-pixel line heights** and card origins whole pixels.
+- **Rust: one `paint_layer` per card's text**, occlusion of covered lines, and cell eviction that never
+  drops a cell drawn in the last two frames.
+- **Rust: cached panels redraw only when their fingerprint changes** (`chat_key`, `chrome_key`). Anything a
+  panel shows must be in its fingerprint; a cached view notified mid-draw also needs `fx.want_frame = true`.
+- **Rust: all text cells are the same size** (GPUI's upload buffers are reused only for same-or-smaller).
+- **The dot grid is placed per dot at exact canvas positions**; rounding the spacing makes it slide.
+- **VS Code: look up a region's host with `hostOf`**, not `S.files`; hosts can be floating snippets.
+- **VS Code: `--inv-z` goes on far-zoom labels only**, never on the world (it would restyle every line).
+- **Both: the state format** is read by older and newer versions alike; add fields with defaults.
 
 ## Measuring
 
