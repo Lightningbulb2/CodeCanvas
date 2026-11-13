@@ -1,0 +1,157 @@
+{
+  "name": "codecanvas",
+  "displayName": "CodeCanvas",
+  "description": "An infinite canvas for your code: lay out files, carve them into snippets, draft snippets with local or cloud LLMs, and merge them back line-by-line.",
+  "version": "0.7.6",
+  "publisher": "codecanvas",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Visualization",
+    "Machine Learning",
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "codecanvas",
+          "title": "CodeCanvas",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "codecanvas": [
+        {
+          "id": "codecanvas.launcher",
+          "name": "Canvas",
+          "type": "webview"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "codecanvas.open",
+        "title": "CodeCanvas: Open Canvas Window"
+      },
+      {
+        "command": "codecanvas.openFile",
+        "title": "CodeCanvas: Open File on Canvas"
+      },
+      {
+        "command": "codecanvas.explainFile",
+        "title": "CodeCanvas: Explain File"
+      },
+      {
+        "command": "codecanvas.explainAll",
+        "title": "CodeCanvas: Explain All"
+      },
+      {
+        "command": "codecanvas.setApiKey",
+        "title": "CodeCanvas: Set LLM API Key"
+      },
+      {
+        "command": "codecanvas.setSearxng",
+        "title": "CodeCanvas: Set SearXNG URL (web search)"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "codecanvas.openFile",
+          "when": "!explorerResourceIsFolder",
+          "group": "navigation@90"
+        },
+        {
+          "command": "codecanvas.explainFile",
+          "when": "!explorerResourceIsFolder",
+          "group": "navigation@91"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "CodeCanvas",
+      "properties": {
+        "codecanvas.llm.provider": {
+          "type": "string",
+          "enum": [
+            "ollama",
+            "llamacpp",
+            "openai",
+            "anthropic"
+          ],
+          "enumDescriptions": [
+            "Ollama native API (local, default http://localhost:11434)",
+            "llama.cpp llama-server (OpenAI-style API, default http://localhost:8080/v1)",
+            "Any OpenAI-compatible server: LM Studio, vLLM, Jan, OpenAI, OpenRouter…",
+            "Anthropic Claude API"
+          ],
+          "default": "ollama",
+          "description": "Which LLM backend CodeCanvas talks to."
+        },
+        "codecanvas.llm.endpoint": {
+          "type": "string",
+          "default": "",
+          "description": "Base URL. Empty = provider default (ollama: http://localhost:11434, llamacpp: http://localhost:8080/v1, openai: http://localhost:1234/v1 (LM Studio), anthropic: https://api.anthropic.com). If no provider is set and this ends in /v1, an OpenAI-style server is assumed."
+        },
+        "codecanvas.llm.model": {
+          "type": "string",
+          "default": "qwen2.5-coder:7b",
+          "description": "Model name, e.g. qwen2.5-coder:7b (Ollama), a loaded LM Studio model id, or claude-sonnet-5-5."
+        },
+        "codecanvas.llm.temperature": {
+          "type": "number",
+          "default": 0.2
+        },
+        "codecanvas.llm.maxTokens": {
+          "type": "number",
+          "default": 4096
+        },
+        "codecanvas.llm.maxFileReads": {
+          "type": "number",
+          "default": 8,
+          "description": "How many tool calls (project file reads, web searches, page fetches) the model may make per answer."
+        },
+        "codecanvas.openInNewWindow": {
+          "type": "boolean",
+          "default": true,
+          "description": "Pop the canvas out into its own desktop window."
+        },
+        "codecanvas.exclude": {
+          "type": "string",
+          "default": "**/{node_modules,.git,out,dist,build,.next,target,bin,obj,__pycache__,.venv,venv}/**",
+          "description": "Glob of files hidden from the canvas file explorer and Explain All."
+        },
+        "codecanvas.explainAll.maxFiles": {
+          "type": "number",
+          "default": 40
+        },
+        "codecanvas.web.searxngUrl": {
+          "type": "string",
+          "default": "",
+          "description": "URL of a SearXNG instance (e.g. http://localhost:8888) that gives the model web search and page reading. Its settings.yml must list \"json\" under search.formats. Empty = no web access."
+        },
+        "codecanvas.web.maxResults": {
+          "type": "number",
+          "default": 6,
+          "description": "Search results passed to the model per web search."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "npx @vscode/vsce package --allow-missing-repository"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  }
+}
