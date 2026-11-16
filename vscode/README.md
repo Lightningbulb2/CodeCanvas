@@ -41,6 +41,9 @@ To install it permanently, run `npm run package` and install the generated `.vsi
 - **New blank snippet:** double-click empty canvas.
 - **Snippets inside snippets:** a floating snippet's lines select like a file's (drag across them, Shift+drag to move them), and the toolbar can mark a snippet inside it, with its own bar, chat and draft. It moves with its lines and goes along when the snippet is merged into a file.
 - **Lines wider than the card** end in a fade with a bright edge. Hover one to see the rest of it sticking out of the card's right side. While editing, every wide line shows that way (click in it to put the caret there). The ⇥ button in the header, shown when a card has wide lines, keeps them all showing.
+- **Language:** the label next to a card's name is the language it is coloured as. Click it to pick another (Scheme, Lisp and some 30 more) or go back to automatic.
+- **Header buttons** move toward the middle of the header when the context panel or the edge of the view would hide them.
+- **Zoomed far out,** a card's name stays in the middle of the part of it that is on screen.
 - **Resize:** drag a card's left or right edge, or its bottom-right corner.
 - **While editing,** the card's header (and find bar) stays at the top of the view when you scroll down a long card.
 

@@ -103,7 +103,10 @@ button { font: inherit; color: inherit; }
 .card-head .title .dir { color: var(--muted); font-weight: 400; }
 .card-head .dirty { width: 8px; height: 8px; border-radius: 50%; background: var(--fg); display: none; flex: none; }
 .card.is-dirty .card-head .dirty { display: block; }
-.card-head .tools { display: flex; gap: 1px; opacity: .55; transition: opacity .15s; }
+.card-head .tools { display: flex; gap: 1px; opacity: .55; transition: opacity .15s; margin-right: var(--tools-shift, 0px); }
+.lang-chip { flex: none; background: transparent; border: 0; border-radius: 4px; padding: 1px 5px; font: inherit; font-size: 10.5px; color: var(--muted); cursor: pointer; white-space: nowrap; }
+.lang-chip:hover { background: var(--hover); color: var(--fg); }
+.world.far .lang-chip { visibility: hidden; }
 .card:hover .card-head .tools, .card.selected .card-head .tools { opacity: 1; }
 .icon-btn { background: transparent; border: 0; border-radius: 4px; width: 24px; height: 24px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; color: var(--muted); padding: 0; font-size: 13px; }
 .icon-btn:hover { background: var(--hover); color: var(--fg); }
@@ -230,7 +233,7 @@ button { font: inherit; color: inherit; }
 .editor-wrap textarea { flex: 1; font: inherit; line-height: inherit; tab-size: 4; border: 0; outline: none; resize: none; background: transparent; color: var(--fg); padding: 0 12px 0 0; margin: 0; white-space: pre; overflow: hidden; caret-color: var(--warn); }
 
 /* strategic (far zoom) view */
-.far-label { display: none; position: absolute; inset: 0; align-items: center; justify-content: center; text-align: center; pointer-events: none; padding: 10px; border-radius: 9px; }
+.far-label { display: none; position: absolute; inset: 0; overflow: hidden; align-items: center; justify-content: center; text-align: center; pointer-events: none; padding: 10px; border-radius: 9px; }
 .world.far .card .far-label { display: flex; background: color-mix(in srgb, var(--card) 92%, transparent); }
 .world.far .card .far-label span { font-size: calc(15px * var(--inv-z)); font-weight: 600; line-height: 1.2; word-break: break-all; }
 .world.far .card .far-label small { display: block; font-size: calc(11px * var(--inv-z)); color: var(--muted); font-weight: 400; }

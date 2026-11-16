@@ -456,7 +456,11 @@ impl CanvasView {
         let n = self.doc.ctx.len();
         let lines: usize = self.doc.ctx.iter().map(|i| self.doc.ctx_lines(*i)).sum();
         let open = self.hist_open;
-        let mut d = div().w(px(290.)).bg(cola(PANEL, 0.94)).border_1().border_color(col(PANEL_BORDER)).rounded(px(9.)).shadow(vec![shadow(8., 26., 0.4)]).text_size(tpx(12.))
+        let rect = self.ctx_rect.clone();
+        let mut d = div().relative().w(px(290.))
+            // remember where the panel is on screen (card headers move their buttons out from under it)
+            .child(gpui::canvas(move |b, _, _| rect.set([fl(b.origin.x), fl(b.origin.y), fl(b.origin.x + b.size.width), fl(b.origin.y + b.size.height)]), |_, _, _, _| {}).absolute().size_full())
+            .bg(cola(PANEL, 0.94)).border_1().border_color(col(PANEL_BORDER)).rounded(px(9.)).shadow(vec![shadow(8., 26., 0.4)]).text_size(tpx(12.))
             .on_any_mouse_down(cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()))
             .on_scroll_wheel(cx.listener(|_, _: &ScrollWheelEvent, _, cx| cx.stop_propagation()))
             .child(div().flex().items_center().gap(px(6.)).px(px(10.)).py(px(7.)).cursor_pointer().child(div().flex_1().font_weight(FontWeight::SEMIBOLD).child("Context"))

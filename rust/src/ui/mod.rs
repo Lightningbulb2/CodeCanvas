@@ -232,6 +232,9 @@ pub struct CanvasView {
     pub(crate) dead_tiles: Vec<Arc<gpui::RenderImage>>,
     /// Dot-grid tiles by dot spacing in device pixels, most recent last.
     pub(crate) ascii_glyphs: Rc<std::cell::RefCell<render::AsciiGlyphs>>,
+    /// Where the context panel was last drawn, in window pixels (x0, y0, x1, y1): card headers keep their
+    /// buttons out from under it.
+    pub(crate) ctx_rect: Rc<std::cell::Cell<[f32; 4]>>,
     /// Current widths of the explorer and the global chat (they slide open and shut).
     pub(crate) side: (f32, f32),
     pub(crate) sel_at: Instant,
@@ -356,7 +359,7 @@ impl CanvasView {
             drag: None, live: None, selected: HashSet::new(), picked: None, hover_tab: None, peek: None, widest: HashMap::new(), doomed: Vec::new(), undo: Vec::new(), redo: Vec::new(),
             inputs: HashMap::new(), focus_input: None, editing: None, busy: HashMap::new(), tx, rx, explaining: HashMap::new(), explain_queue: None, menu: None, pick: None,
             models: None, show_settings: false, show_help: false, expanded: HashSet::new(), chat_open: true, explorer_open: true, hist_open: true, spans: HashMap::new(), scrolls: HashMap::new(),
-            pending_bottom: HashSet::new(), chat_lists: HashMap::new(), chat_view: { let canvas = cx.weak_entity(); gpui::AppContext::new(cx, |_| ChatPanelView { canvas }) }, chat_key: 0, ui_font, chrome: [Part::Top, Part::Explorer, Part::Context].into_iter().map(|part| { let canvas = cx.weak_entity(); (part, gpui::AppContext::new(cx, |_| ChromeView { canvas, part }), 0) }).collect(), space: false, toasts: Vec::new(), char_ratio, anim: HashMap::new(), fx: Fx::default(), finds: HashMap::new(), tiles: HashMap::new(), tile_shown: HashMap::new(), zoom_aim: HashMap::new(), tile_levels: HashMap::new(), tile_pool: tiles::Pool::new(mono()), tile_inbox: Default::default(), frame: 0, scale: 1., dead_tiles: Vec::new(), ascii_glyphs: Default::default(), side: (EXPLORER_W, CHAT_W), sel_at: Instant::now(), started: Instant::now(), focus, win_size: (1500., 950.), mouse: (0., 0.), mods: Default::default(),
+            pending_bottom: HashSet::new(), chat_lists: HashMap::new(), chat_view: { let canvas = cx.weak_entity(); gpui::AppContext::new(cx, |_| ChatPanelView { canvas }) }, chat_key: 0, ui_font, chrome: [Part::Top, Part::Explorer, Part::Context].into_iter().map(|part| { let canvas = cx.weak_entity(); (part, gpui::AppContext::new(cx, |_| ChromeView { canvas, part }), 0) }).collect(), space: false, toasts: Vec::new(), char_ratio, anim: HashMap::new(), fx: Fx::default(), finds: HashMap::new(), tiles: HashMap::new(), tile_shown: HashMap::new(), zoom_aim: HashMap::new(), tile_levels: HashMap::new(), tile_pool: tiles::Pool::new(mono()), tile_inbox: Default::default(), frame: 0, scale: 1., dead_tiles: Vec::new(), ascii_glyphs: Default::default(), ctx_rect: Default::default(), side: (EXPLORER_W, CHAT_W), sel_at: Instant::now(), started: Instant::now(), focus, win_size: (1500., 950.), mouse: (0., 0.), mods: Default::default(),
             state_dirty: None, mtimes: HashMap::new(), last_poll: Instant::now(), inbox, saver, doc_dirty: true,
         };
         if let Some(s) = this.project.load_state() {
@@ -838,6 +841,24 @@ impl CanvasView {
         if self.drag.is_some() { self.pointer_moved(x, y, e.modifiers); cx.notify(); }
         let peek = if self.drag.is_none() { self.peek_at(x, y) } else { None };
         if peek != self.peek { self.peek = peek; cx.notify(); }
+    }
+
+    /// Sets the language a card is highlighted as (`None`: from its file name, or guessed from a snippet's code).
+    pub(crate) fn set_lang(&mut self, id: u64, ext: Option<&str>) {
+        let Some(c) = self.doc.card_mut(id) else { return };
+        c.lang = match (ext, &c.path) { (Some(e), _) => format!("x.{e}"), (None, Some(p)) => p.clone(), (None, None) => crate::model::guess_lang(&c.lines) };
+        // drop what was drawn in the old colours
+        self.spans.remove(&id);
+        self.retire_tiles(|k, _| k.1 == id);
+        self.touch();
+    }
+
+    /// The menu of languages for a card, opened from its header.
+    pub(crate) fn lang_menu(&mut self, id: u64, x: f32, y: f32) {
+        let auto = if self.doc.card(id).is_some_and(Card::is_file) { "Automatic (from the file name)" } else { "Automatic (guess from the code)" };
+        let mut list: Vec<(String, Option<Act>)> = vec![("Language".into(), None), (auto.into(), Some(Rc::new(move |t, _, _| t.set_lang(id, None))))];
+        for (name, ext) in crate::highlight::LANGS { list.push((name.to_string(), Some(Rc::new(move |t, _, _| t.set_lang(id, Some(ext)))))); }
+        self.menu = Some(Menu { x, y, items: list.into_iter().map(|(label, act)| MenuItem { label, act }).collect(), at: Instant::now() });
     }
 
     /// Columns of code that fit across a card (wider lines are cut off at its right edge).

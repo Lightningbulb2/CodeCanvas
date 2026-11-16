@@ -17,6 +17,7 @@ Launching again while a project is open shows it in the running window; the laun
 | Move any card | Drag the header; Space+drag anywhere on it |
 | Multi-select | Ctrl/Shift+click, or drag a box on empty canvas |
 | Edit | Double-click a file or snippet. Esc finishes, Ctrl+S saves |
+| Language | Click the label next to a card's name to colour it as another language, or go back to automatic |
 | New snippet | Double-click empty canvas |
 | Fit / undo / redo / save all | `F` / Ctrl+Z / Ctrl+Y / Ctrl+S |
 | Split views | Top-bar buttons, a view's bar, or Ctrl+\ (Ctrl+Shift+\ splits down) |

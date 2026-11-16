@@ -1,7 +1,7 @@
 // CodeCanvas core: split panes, file + snippet cards, live drag reflow, references, drafts, edit mode, undo.
 import { send, request, stream } from './bridge.js';
 import { createChat } from './chat.js';
-import { h, esc, uid, clamp, basename, dirname, extColor, nextColor, icons, highlightLines, toast, plural } from './util.js';
+import { h, esc, uid, clamp, basename, dirname, extColor, nextColor, icons, highlightLines, toast, plural, LANGS, langName } from './util.js';
 
 const EDITOR = window.CC_EDITOR || 'VS Code';
 export const LH = 19;          // line height (px) — must match --lh
@@ -89,7 +89,7 @@ function paneAt(cx, cy) {
   }
   return null;
 }
-const mount = c => { const P = paneOf(c); c.pane = P.id; P.world.append(c.el); };
+const mount = c => { const P = paneOf(c); c.pane = P.id; P.world.append(c.el); c._toolsShift = null; c._farBox = null; c._headFixed = null; placeOverlaid(P, c); };
 
 function makeWorld() {
   const world = h('div', { class: 'world' });
@@ -377,6 +377,7 @@ function applyView(P) {
   const el = P.mirror || P.world; // shared mode: non-host panes draw their mirror
   el.style.transform = `translate(${x}px, ${y}px) scale(${z})`;
   if (S.editing && paneOf(S.editing) === P) stickHeader(S.editing);
+  placeOverlaid(P);
   let g = 24 * z;
   while (g < 14) g *= 4;
   P.el.style.backgroundSize = `${g}px ${g}px`;
@@ -489,7 +490,7 @@ const snippetLines = s => s.fileId ? hostOf(s.fileId).lines.slice(s.start, s.end
 /** What a marked snippet lives in: a file, or a floating snippet (snippets can be marked inside snippets too). */
 const hostOf = id => S.files.get(id) || S.snippets.get(id);
 /** A path that names a card's language: the file's own, or the snippet's. */
-const hostPath = c => (!c ? '' : c.type === 'file' ? c.path : snippetPath(c));
+const hostPath = c => (!c ? '' : c.syntax ? 'x.' + c.syntax : c.type === 'file' ? c.path : snippetPath(c));
 /** Redraws a card after its lines or its marked snippets changed. */
 function renderHost(c) { if (!c) return; if (c.type === 'file') renderFile(c); else if (c.el) renderSnippetCard(c); }
 /** A floating snippet whose lines are its own (not a reference), so it can hold marked snippets. */
@@ -575,6 +576,42 @@ function peekAt(e) {
   if (peekCard && (peekCard !== target || peekCard._peek !== i)) { const p = peekCard; peekCard = null; p._peek = null; paintPillars(p); }
   if (target && target._peek !== i) { target._peek = i; peekCard = target; paintPillars(target); }
 }
+/**
+ * Every frame the view moves: each card's header buttons move toward the middle of the header by as much as
+ * the context panel or the view's right edge would hide them, and when zoomed out to names, each name stays
+ * in the middle of the part of its card that is on screen. Reads come first, then only changed writes.
+ */
+function placeOverlaid(P, only) {
+  if (!P) return;
+  const { x, y, z } = P.view;
+  const pr = P.el.getBoundingClientRect();
+  const panelEl = document.getElementById('ctxHistory');
+  if (panelEl && !panelEl._watched) { panelEl._watched = true; new ResizeObserver(() => { for (const Q of panes.values()) placeOverlaid(Q); }).observe(panelEl); }
+  const panel = panelEl?.getBoundingClientRect();
+  const cards = only ? [only] : allCards().filter(c => c.el && inPane(c, P));
+  const hs = P.far ? cards.map(c => cardH(c)) : null;
+  cards.forEach((c, k) => {
+    const sx = c.x * z + x, sy = c.y * z + y, sw = c.w * z;
+    if (P.far) {
+      const sh = hs[k] * z, vt = Math.max(sy, 0), vb = Math.min(sy + sh, pr.height), vl = Math.max(sx, 0), vr = Math.min(sx + sw, pr.width);
+      const box = vb > vt && vr > vl ? `${(vt - sy) / z}|${(vl - sx) / z}|${(vr - vl) / z}|${(vb - vt) / z}` : '';
+      if (box !== c._farBox) {
+        c._farBox = box;
+        const l = c.el.querySelector('.far-label');
+        if (l) { const [t, le, w, hh] = box ? box.split('|') : ['', '', '', '']; Object.assign(l.style, box ? { top: t + 'px', left: le + 'px', width: w + 'px', height: hh + 'px', right: 'auto', bottom: 'auto' } : { top: '', left: '', width: '', height: '', right: '', bottom: '' }); }
+      }
+      return;
+    }
+    let limit = pr.left + pr.width;
+    const headTop = pr.top + sy + (c._stuck || 0) * z, headBot = headTop + HEAD * z, right = pr.left + sx + sw;
+    if (panel && panel.height && headTop < panel.bottom && headBot > panel.top && panel.left < right) limit = Math.min(limit, panel.left);
+    // as far as the title can give way: everything else in the header keeps its width (measured once per render)
+    if (c._headFixed == null) { const hd = c.el.querySelector('.card-head'); const t = hd?.querySelector('.title'); c._headFixed = hd ? [...hd.children].filter(k => k !== t).reduce((a, k) => a + k.offsetWidth, 0) - (c._toolsShift || 0) + 30 : 0; }
+    const shift = Math.round(clamp(right - limit + 8, 0, Math.max(0, sw - c._headFixed * z)) / z);
+    if (shift !== c._toolsShift) { c._toolsShift = shift; c.el.querySelector('.card-head')?.style.setProperty('--tools-shift', shift + 'px'); }
+  });
+}
+
 /** While a card is edited, its header and find bar stay at the top of the view when its top scrolls above it. */
 function stickHeader(c) {
   const head = c?.el?.querySelector('.card-head');
@@ -591,6 +628,7 @@ function stickHeader(c) {
 }
 /** A path-like string that tells the highlighter what language a snippet is in. */
 function snippetPath(s) {
+  if (s.syntax) return 'x.' + s.syntax;
   if (s.fileId) return hostPath(hostOf(s.fileId));
   const r = refSource(s);
   if (r) return hostPath(hostOf(r.fileId));
@@ -625,6 +663,9 @@ function positionCard(c) {
   c.el.style.left = c.x + 'px';
   c.el.style.top = c.y + 'px';
   c.el.style.width = c.w + 'px';
+  // its header was just built or it moved: place its buttons (and far label) again
+  c._toolsShift = null; c._farBox = null; c._headFixed = null;
+  if (c.el.isConnected) placeOverlaid(paneOf(c), c);
 }
 
 /** Finds a free spot for a w×h card near (px,py) in pane P. */
@@ -782,10 +823,11 @@ function renderFile(f) {
   const head = h('div', { class: 'card-head' },
     h('span', { class: 'ico', style: { background: extColor(f.path) } }),
     h('span', { class: 'title', title: f.path, html: `<span class="dir">${esc(dir)}</span>${esc(base)}` }),
+    langChip(f),
     h('span', { class: 'dirty', title: 'Unsaved changes' }),
     tools);
 
-  const hl = highlightLines(f.lines, f.path);
+  const hl = highlightLines(f.lines, hostPath(f));
   const linesEl = h('div', { class: 'lines' });
   linesEl.innerHTML = hl.map((x, i) => `<div class="ln"><span class="no">${i + 1}</span><span class="code">${x}</span></div>`).join('');
   f.linesEl = linesEl;
@@ -811,6 +853,19 @@ function renderFile(f) {
 function sizeFarLabel(c) {
   const P = paneOf(c);
   if (P?.far) c.el?.querySelector('.far-label')?.style.setProperty('--inv-z', String(1 / P.view.z));
+}
+
+/** The language a card is highlighted as; a click picks another (or back to automatic). */
+function langChip(c) {
+  const chip = h('button', { class: 'lang-chip', title: 'Language used for colouring; click to change' }, langName(hostPath(c)));
+  chip.addEventListener('pointerdown', e => e.stopPropagation());
+  chip.addEventListener('click', e => {
+    e.stopPropagation();
+    const set = ext => { if (ext) c.syntax = ext; else delete c.syntax; renderHost(c); for (const x of S.snippets.values()) if (x.ref && refSource(x)?.fileId === c.id && x.el) renderSnippetCard(x); scheduleSave(); };
+    showMenu(e, [{ header: 'Language' }, { label: c.type === 'file' ? 'Automatic (from the file name)' : 'Automatic (guess from the code)', fn: () => set(null) },
+      ...LANGS.map(([name, ext]) => ({ label: name, fn: () => set(ext) }))]);
+  });
+  return chip;
 }
 
 function iconBtn(icon, title, fn, cls = '') {
@@ -1068,7 +1123,7 @@ function renderSnippetCard(s) {
   );
   const titleEl = h('span', { class: 'title', title: 'Double-click to rename' }, s.title);
   titleEl.addEventListener('dblclick', e => { e.stopPropagation(); renameInline(s, titleEl); });
-  const head = h('div', { class: 'card-head' }, h('span', { class: 'ico' }), titleEl, tools);
+  const head = h('div', { class: 'card-head' }, h('span', { class: 'ico' }), titleEl, langChip(s), tools);
   const kids = [head];
   if (src) {
     const sf = hostOf(src.fileId);
@@ -1083,7 +1138,7 @@ function renderSnippetCard(s) {
   const start = src ? src.start + 1 : 1;
   const linesEl = h('div', { class: 'lines' });
   const sfPath = src ? hostPath(hostOf(src.fileId)) : null;
-  linesEl.innerHTML = highlightLines(s.lines, sfPath || snippetPath(s))
+  linesEl.innerHTML = highlightLines(s.lines, s.syntax ? snippetPath(s) : sfPath || snippetPath(s))
     .map((x, i) => `<div class="ln"><span class="no">${start + i}</span><span class="code">${x}</span></div>`).join('');
   s.linesEl = linesEl;
   s.regionsEl = h('div', { class: 'regions' });
@@ -2256,7 +2311,7 @@ function enterEdit(c, line = 0) {
   const ta = h('textarea', { spellcheck: 'false', wrap: 'off' });
   ta.value = lines.join('\n');
   // Syntax colours while editing: a highlighted copy sits under a textarea whose own text is transparent.
-  const path = c.type === 'file' ? c.path : snippetPath(c);
+  const path = hostPath(c);
   const hlEl = h('div', { class: 'ed-hl', 'aria-hidden': 'true' });
   let hlRaf = 0;
   const paintHl = () => {
@@ -3206,7 +3261,7 @@ function plainSnippet(s) {
 }
 const plainFile = (f, withLines) => ({
   id: f.id, path: f.path, pane: f.pane, x: f.x, y: f.y, w: f.w, chat: f.chat, mode: f.mode, drawerOpen: f.drawerOpen,
-  draft: f.draft || undefined, draftOpen: f.draftOpen || undefined, wide: f.wide || undefined,
+  draft: f.draft || undefined, draftOpen: f.draftOpen || undefined, wide: f.wide || undefined, syntax: f.syntax || undefined,
   ...(withLines ? { lines: f.lines, saved: f.saved, eol: f.eol } : { lines: isDirty(f) ? f.lines : undefined }),
 });
 function snapshot() {
@@ -3291,7 +3346,7 @@ export async function restoreSaved(st) {
     id: f.id, w: f.w, lines: f.lines, silent: true, pane: f.pane, chat: f.chat, mode: f.mode, drawerOpen: f.drawerOpen,
   })));
   const ok = new Set(results.filter(Boolean).map(f => f.id));
-  for (const f of st.files || []) { const c = S.files.get(f.id); if (c) Object.assign(c, { draft: f.draft, draftOpen: !!f.draftOpen, wide: !!f.wide }); }
+  for (const f of st.files || []) { const c = S.files.get(f.id); if (c) Object.assign(c, { draft: f.draft, draftOpen: !!f.draftOpen, wide: !!f.wide, syntax: f.syntax }); }
   const list = st.snippets || [];
   for (const s of list) if (!s.fileId) S.snippets.set(s.id, s);
   for (const s of list) {

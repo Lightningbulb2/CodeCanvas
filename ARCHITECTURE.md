@@ -240,7 +240,8 @@ ending in `El`). Undo keeps up to 60 JSON snapshots of files and snippets.
 
 | To change | rust/ | vscode/ |
 |---|---|---|
-| Card header buttons | `header_el` in `ui/render.rs` | `renderFile` / `renderSnippetCard` in `canvas.js` |
+| Card header buttons | `header_el` in `ui/render.rs` (moved clear of the context panel in `render_cards`) | `renderFile` / `renderSnippetCard`; `placeOverlaid` moves them in `canvas.js` |
+| Languages and highlighting | `highlight.rs` (`LANGS`, `lisp_line`), `lang_menu` / `set_lang` in `ui/mod.rs` | `util.js` (`LANGS`, `highlightLisp`), `langChip` and `syntax` in `canvas.js` |
 | What a click or drag on a card does | `file_body_down`, `start_move`, `enum Drag`, `on_up` in `ui/mod.rs` | `onPointerDown` and the `start…` functions in `canvas.js` |
 | Selection toolbar, right-click menus | `selection_tools` (render), `card_menu`, `region_menu` (panels) | `showSelTools`, the menu builder in `canvas.js` |
 | Tabs and drawers beside a card | `overlays`, `chat_stack` in `ui/render.rs` | `renderRegions`, `buildTab`, `buildDraftTab` |

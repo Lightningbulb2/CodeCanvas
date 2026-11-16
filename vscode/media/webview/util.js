@@ -73,8 +73,79 @@ const KW = new Set(('abstract as async await break case catch class const contin
   'void volatile where while with yield local then end elseif require').split(' '));
 const TYPES = new Set('int uint long short char bool boolean float double string String number any unknown never object Object Array Map Set Promise i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 usize isize str Vec Option Result size_t auto byte'.split(' '));
 
+/** The languages a card can be set to: [name, the file extension the highlighter goes by]. */
+export const LANGS = [
+  ['Plain text', 'txt'], ['C', 'c'], ['C++', 'cpp'], ['C#', 'cs'], ['Go', 'go'], ['Java', 'java'], ['JavaScript', 'js'],
+  ['TypeScript', 'ts'], ['Rust', 'rs'], ['Swift', 'swift'], ['Kotlin', 'kt'], ['Zig', 'zig'], ['CSS', 'css'], ['JSON', 'json'],
+  ['Python', 'py'], ['Ruby', 'rb'], ['Shell', 'sh'], ['PowerShell', 'ps1'], ['Perl', 'pl'], ['R', 'r'], ['YAML', 'yaml'],
+  ['TOML', 'toml'], ['INI / config', 'ini'], ['Lua', 'lua'], ['SQL', 'sql'], ['Haskell', 'hs'], ['Scheme', 'scm'],
+  ['Racket', 'rkt'], ['Common Lisp', 'lisp'], ['Emacs Lisp', 'el'], ['Clojure', 'clj'], ['Fennel', 'fnl'],
+  ['HTML', 'html'], ['XML', 'xml'], ['Markdown', 'md'],
+];
+/** The name of the language a path (or `x.ext`) is highlighted as. */
+export function langName(path) {
+  const e = extOf(path || '');
+  const hit = LANGS.find(l => l[1] === e);
+  return hit ? hit[0] : e ? e.toUpperCase() : 'Plain text';
+}
+const LISP_EXT = ['scm', 'ss', 'sls', 'sld', 'rkt', 'el', 'lisp', 'lsp', 'cl', 'clj', 'cljs', 'cljc', 'edn', 'fnl', 'janet'];
+const LISP_KW = new Set(('define define* define-public define-module define-record-type define-syntax define-syntax-rule define-values define-macro ' +
+  'define-library lambda lambda* case-lambda let let* letrec letrec* let-values let*-values let-syntax if cond case when unless else begin do and or ' +
+  'not quote quasiquote unquote set! syntax-rules syntax-case use-modules import export module library match match-lambda guard parameterize delay ' +
+  'force values receive inherit modify-phases add-after add-before replace delete defun defmacro defvar defparameter defconst defcustom defn defn- ' +
+  'def fn ns require setq setf progn loop dolist dotimes flet labels while unwind-protect condition-case catch throw').split(' '));
+
+/** One line of a Lisp: `;` comments, `#| |#` comments and strings that carry across lines, `#:keywords`, `#t`/`#f`,
+ * characters, numbers and quoted symbols; special forms anywhere, and the head of a list as a call. */
+function highlightLisp(line, state) {
+  const span = (cls, t) => `<span class="tok-${cls}">${esc(t)}</span>`;
+  let out = '', i = 0;
+  const n = line.length;
+  const strEnd = from => { for (let j = from; j < n; j++) { if (line[j] === '\\') j++; else if (line[j] === '"') return j + 1; } return -1; };
+  if (state === 'lblock') {
+    const e = line.indexOf('|#');
+    if (e < 0) return { html: span('com', line), state };
+    out += span('com', line.slice(0, e + 2)); i = e + 2;
+  } else if (state === 'lstr') {
+    const e = strEnd(0);
+    if (e < 0) return { html: span('str', line), state };
+    out += span('str', line.slice(0, e)); i = e;
+  }
+  const sym = /^[\w\-!?*<>=/+.:%&^~$@]+/u;
+  let head = false;
+  while (i < n) {
+    const c = line[i], rest = line.slice(i);
+    if (c === ';') { out += span('com', rest); return { html: out, state: null }; }
+    if (rest.startsWith('#|')) {
+      const e = line.indexOf('|#', i + 2);
+      if (e < 0) { out += span('com', rest); return { html: out, state: 'lblock' }; }
+      out += span('com', line.slice(i, e + 2)); i = e + 2; continue;
+    }
+    if (c === '"') {
+      const e = strEnd(i + 1);
+      if (e < 0) { out += span('str', rest); return { html: out, state: 'lstr' }; }
+      out += span('str', line.slice(i, e)); i = e; head = false; continue;
+    }
+    if (c === '(' || c === '[') { out += span('punc', c); head = true; i++; continue; }
+    let m;
+    if ((m = /^#:[^\s()[\]";]+/.exec(rest))) { out += span('type', m[0]); i += m[0].length; head = false; continue; }
+    if ((m = /^(#\\.[\w-]*|#[tf](?![\w\-!?*<>=/+.:%&^~$@]))/.exec(rest))) { out += span('num', m[0]); i += m[0].length; head = false; continue; }
+    if ((m = /^[-+]?\d[\w.\/]*/.exec(rest)) && !/[\w\-!?*<>=/+.:%&^~$@]/.test(line[i - 1] || '')) { out += span('num', m[0]); i += m[0].length; head = false; continue; }
+    if (c === "'" && (m = sym.exec(line.slice(i + 1)))) { out += span('type', "'" + m[0]); i += m[0].length + 1; head = false; continue; }
+    if ((m = sym.exec(rest))) {
+      const w = m[0];
+      out += LISP_KW.has(w) ? span('kw', w) : head ? span('fn', w) : esc(w);
+      i += w.length; head = false; continue;
+    }
+    if (!/\s/.test(c)) head = false;
+    out += /[)\]]/.test(c) ? span('punc', c) : esc(c); i++;
+  }
+  return { html: out, state: null };
+}
+
 export function langOf(path) {
   const e = extOf(path || '');
+  if (LISP_EXT.includes(e)) return 'lisp';
   if (['py', 'rb', 'sh', 'yml', 'yaml', 'toml', 'ps1', 'r', 'pl', 'conf', 'ini', 'dockerfile', 'mk', 'makefile'].includes(e)) return 'hash';
   if (['lua', 'sql', 'hs'].includes(e)) return 'dash';
   if (['html', 'xml', 'svg', 'vue', 'md', 'txt', 'csv', ''].includes(e)) return 'plain';
@@ -84,6 +155,7 @@ export function langOf(path) {
 /** Returns {html, state} where state carries an open block comment across lines. */
 export function highlightLine(line, lang, state) {
   if (lang === 'plain' || line.length > 2000) return { html: esc(line), state: null };
+  if (lang === 'lisp') return highlightLisp(line, state);
   let out = '', i = 0;
   const n = line.length;
   if (state === 'block') {

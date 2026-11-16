@@ -505,14 +505,14 @@ impl CanvasView {
         out
     }
 
-    fn header_el(&mut self, card: &Card, pane: u64, z: f32, cx: &mut Context<Self>) -> Div {
+    fn header_el(&mut self, card: &Card, pane: u64, z: f32, shift: f32, cx: &mut Context<Self>) -> Div {
         let id = card.id;
         let is_file = card.is_file();
         let in_ctx = self.doc.ctx.contains(&id);
         let selected = self.selected.contains(&id);
         let editing = self.editing == Some(id);
         let group: SharedString = format!("card{id}").into();
-        let mut tools = div().flex().flex_none().gap(px(z)).when(!selected && !editing, |d| d.opacity(0.55).group_hover(group, |s| s.opacity(1.)));
+        let mut tools = div().flex().flex_none().gap(px(z)).mr(px(shift)).when(!selected && !editing, |d| d.opacity(0.55).group_hover(group, |s| s.opacity(1.)));
         let sz = 14. * z;
         let ctx_color = if in_ctx { OK } else { MUTED };
         if !editing && self.has_wide(card) {
@@ -569,6 +569,10 @@ impl CanvasView {
         div().relative().flex().items_center().gap(px(7. * z)).h(px(HEAD * z)).pl(px(11. * z)).pr(px(6. * z)).bg(bg).rounded_t(px((9. * z - 1.).max(0.))).border_b_1().border_color(col(BORDER))
             .text_size(tz(12.5, z)).text_color(col(FG)).cursor_grab()
             .child(ico.size(px(9. * z)).flex_none()).child(title)
+            // the language it is highlighted as; a click picks another
+            .child(div().flex_none().px(px(5. * z)).rounded(px(4. * z)).text_size(tz(10.5, z)).text_color(col(MUTED)).whitespace_nowrap().cursor_pointer()
+                .hover(|s| s.bg(col(HOVER)).text_color(col(FG))).child(crate::highlight::lang_name(&card.lang))
+                .on_mouse_down(MouseButton::Left, cx.listener(move |t, e: &MouseDownEvent, _, cx| { cx.stop_propagation(); t.lang_menu(id, fl(e.position.x), fl(e.position.y)); cx.notify(); })))
             .when(card.dirty(), |d| d.child(div().size(px(8. * z)).flex_none().rounded_full().bg(col(FG))))
             .when(editing, |d| d.child(div().flex_none().text_size(tz(10., z)).text_color(col(WARN)).whitespace_nowrap().child("EDITING · Esc to finish · Ctrl+S to save")))
             .child(tools)
@@ -585,6 +589,7 @@ impl CanvasView {
 
     fn render_cards(&mut self, pane: u64, vw: f32, vh: f32, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let v = self.pv(pane).v;
+        let rect = self.rect_of(pane);
         let z = v.z;
         let (over, ghost_card) = self.live.as_ref().map_or((None, None), |l| (l.over, l.ghost_card));
         let live_pane_ok = self.live.as_ref().is_some_and(|l| self.shared || l.pane == pane);
@@ -639,10 +644,18 @@ impl CanvasView {
                 let cid = c.id;
                 let (dir, base) = dir_and_base(&c.title);
                 let name = if c.ref_of.is_some() { format!("↗ {}", c.title) } else { base.to_string() };
-                let small = if c.is_file() { format!("{dir} · {n_lines} lines") } else { format!("{n_lines} lines") };
-                out.push(self.card_box(sx, sy, sw, sh, z, border).bg(cola(CARD, 0.92)).flex().flex_col().items_center().justify_center().gap(px(2.)).px(px(6.))
-                    .child(div().text_size(tpx(15.)).font_weight(FontWeight::SEMIBOLD).text_color(col(if c.is_file() { FG } else { c.color })).whitespace_nowrap().child(name))
-                    .when(sh > 44., |d| d.child(div().text_size(tpx(11.)).text_color(col(MUTED)).whitespace_nowrap().child(small)))
+                let small = if c.is_file() && !dir.is_empty() { format!("{dir} · {n_lines} lines") } else { format!("{n_lines} lines") };
+                out.push(self.card_box(sx, sy, sw, sh, z, border).bg(cola(CARD, 0.92))
+                    // the name stays in the middle of the part of the card that is on screen, so a long file's
+                    // label is in view wherever you are along it
+                    .child({
+                        let (vt, vb) = (sy.max(0.), (sy + sh).min(vh));
+                        let (vl, vr) = (sx.max(0.), (sx + sw).min(vw));
+                        div().absolute().left(px(vl - sx)).top(px(vt - sy)).w(px((vr - vl).max(0.))).h(px((vb - vt).max(0.)))
+                            .flex().flex_col().items_center().justify_center().gap(px(2.)).px(px(6.)).overflow_hidden()
+                            .child(div().w_full().text_center().text_size(tpx(15.)).line_height(tpx(18.)).font_weight(FontWeight::SEMIBOLD).text_color(col(if c.is_file() { FG } else { c.color })).child(name))
+                            .when(sh > 44., |d| d.child(div().w_full().text_center().text_size(tpx(11.)).text_color(col(MUTED)).child(small)))
+                    })
                     // zoomed out to names: Space+drag moves the card (a plain drag still pans or selects)
                     .on_mouse_down(MouseButton::Left, cx.listener(move |t, e: &MouseDownEvent, _, cx| if t.space { t.start_move(cid, e, pane, cx); }))
                     .into_any_element());
@@ -653,7 +666,21 @@ impl CanvasView {
             let above: Vec<[f32; 4]> = cover.iter().skip(i + 1).flatten().filter(|r| r[2] > r[0] && r[3] > r[1]).copied().collect();
             let lines = self.lines_el(c, pane, sx, sy, vw, vh, docking, &above, cx);
             let regions = self.regions_el(c, pane, cx);
-            let header = self.header_el(c, pane, z, cx);
+            // The header's buttons stay clear of the context panel and the view's right edge: they move
+            // toward the middle of the header by as much as they would be hidden.
+            let stick = if editing && sy < 0. { (-sy).min((sh - HEAD * z).max(0.)) } else { 0. };
+            let shift = {
+                let [cx0, cy0, _, cy1] = self.ctx_rect.get();
+                let (hx1, hy0) = (rect.x + sx + sw, rect.y + sy + stick);
+                let mut limit = rect.x + vw;
+                if cy1 > cy0 && hy0 < cy1 && hy0 + HEAD * z > cy0 && cx0 < hx1 { limit = limit.min(cx0); }
+                // as far as the title can give way: the buttons, the language label, the icon and (while
+                // editing) the hint stay their size
+                let n = if c.is_file() { 8 } else { 4 + usize::from(c.ref_of.is_some()) + usize::from(c.target.is_some()) } + usize::from(!editing && self.has_wide(c));
+                let fixed = (n as f32 * 25. + 100. + if editing { 270. } else { 0. }) * z;
+                (hx1 - limit + 8.).clamp(0., (sw - fixed).max(0.))
+            };
+            let header = self.header_el(c, pane, z, shift, cx);
             let resize = div().absolute().right_0().bottom_0().size(px(14. * z)).cursor_nwse_resize()
                 .child(div().absolute().right(px(4. * z)).bottom(px(4. * z)).size(px(6. * z)).border_r_2().border_b_2().border_color(cola(MUTED, 0.5)))
                 .on_mouse_down(MouseButton::Left, cx.listener(move |t, e: &MouseDownEvent, _, cx| {
@@ -675,10 +702,9 @@ impl CanvasView {
             } else {
                 // While a card is edited, its header (and find bar) stay at the top of the view when the
                 // card's top is scrolled above it, down to the card's last line.
-                let stick = if editing && sy < 0. { (-sy).min((sh - HEAD * z).max(0.)) } else { 0. };
                 let header = if stick > 0. { header.top(px(stick)).shadow(vec![shadow(4. * z, 14. * z, 0.55)]) } else { header };
                 let bar = self.find_bar(id, c.w, z, stick, cx);
-                let (marks, pillars) = self.overflow_els(c, sx, sy, vh, z, cx);
+                let (marks, pillars) = self.overflow_els(c, pane, sx, sy, vh, z, cx);
                 out.push(shell.child(lines).children(marks).children(regions).child(header).child(resize).children(bar).into_any_element());
                 // the left and right edges drag to resize, as on a window; just outside the border so they
                 // don't take clicks from the snippet bars
@@ -709,7 +735,7 @@ impl CanvasView {
     /// every such line while the card is edited or its overflow toggle is on, otherwise only for the
     /// line the pointer rests on.
     #[allow(clippy::too_many_arguments)]
-    fn overflow_els(&mut self, c: &Card, sx: f32, sy: f32, vh: f32, z: f32, cx: &mut Context<Self>) -> (Vec<AnyElement>, Vec<AnyElement>) {
+    fn overflow_els(&mut self, c: &Card, pane: u64, sx: f32, sy: f32, vh: f32, z: f32, cx: &mut Context<Self>) -> (Vec<AnyElement>, Vec<AnyElement>) {
         let (mut marks, mut pillars) = (Vec::new(), Vec::new());
         let id = c.id;
         let editing = self.editing == Some(id);
@@ -742,22 +768,40 @@ impl CanvasView {
                 continue;
             }
             let (text, hl) = display_line(&lines[i], spans.as_ref().and_then(|s| (i < s.len()).then(|| s.line(i))).flatten());
-            let Some(off) = text.char_indices().nth(fit).map(|(b, _)| b) else { continue };
-            let end = text.char_indices().nth(fit + 600).map_or(text.len(), |(b, _)| b);
-            let tail: SharedString = if end < text.len() { format!("{}…", &text[off..end]).into() } else { text[off..].to_string().into() };
-            let hl: Vec<(Range<usize>, HighlightStyle)> = hl.into_iter().filter(|(r, _)| r.end > off && r.start < end).map(|(r, s)| (r.start.max(off) - off..r.end.min(end) - off, s)).collect();
-            let x0 = sx + gutter + fit as f32 * cw;
+            // The card's text starts inside its 1 px border; the pillar starts at column `fit` of that text
+            // and paints the line with the same painter from the same origin, so the two meet exactly.
+            let x0 = sx + 1. + gutter + fit as f32 * cw;
+            let top_px = sy + 1. + y;
             let cols = (n - fit).min(601) as f32;
             let pad = 8. * z;
             let caret_x = caret.filter(|(l, col)| *l == i && *col >= fit).map(|(_, col)| (col - fit) as f32 * cw);
-            pillars.push(div().absolute().left(px(x0)).top(px(sy + y)).h(px(lh)).w(px(cols * cw + pad))
-                .bg(col(CARD)).border_1().border_l_0().border_color(cola(ACCENT, 0.45)).rounded_r(px(4. * z)).shadow(vec![shadow(4. * z, 12. * z, 0.4)])
-                .font_family(mono()).text_size(tz(12.5, z)).line_height(px(lh)).text_color(col(FG)).whitespace_nowrap().overflow_hidden().cursor_text()
-                .child(StyledText::new(tail).with_highlights(hl))
+            let (shift, glyphs, font_px, pos_px) = (fit as f32 * cw, self.ascii_glyphs.clone(), self.code_px(z), 12.5 * z);
+            let edge = cola(ACCENT, 0.45);
+            let pane_x = self.rect_of(pane).x;
+            pillars.push(div().absolute().left(px(x0)).top(px(top_px)).h(px(lh)).w(px(cols * cw + pad))
+                .bg(col(CARD)).rounded_r(px(4. * z)).shadow(vec![shadow(4. * z, 12. * z, 0.4)]).overflow_hidden().cursor_text()
+                .child(canvas(|_, _, _| (), move |b: Bounds<Pixels>, _, window, _| {
+                    let base = font(mono());
+                    let italic = base.clone().italic();
+                    let origin = point(b.origin.x - px(shift), b.origin.y);
+                    window.with_content_mask(Some(gpui::ContentMask { bounds: b }), |window| window.paint_layer(b, |window| {
+                        if text.is_ascii() {
+                            paint_mono(&text, &hl, col(FG), 1., origin, px(lh), font_px, pos_px, cw, &mut glyphs.borrow_mut(), &base, &italic, window);
+                        } else {
+                            let ts = window.text_system().clone();
+                            let code = ts.layout_line(&text, px(SHAPE_PX), &text_runs(text.len(), &hl, &base, &italic), None);
+                            paint_scaled(&code, &hl, col(FG), 1., origin, px(lh), font_px, pos_px, window);
+                        }
+                    }));
+                }).absolute().size_full())
+                // the edge, drawn inside the box so nothing shifts the text
+                .child(div().absolute().left_0().right_0().top_0().h(px(1.)).bg(edge))
+                .child(div().absolute().left_0().right_0().bottom_0().h(px(1.)).bg(edge))
+                .child(div().absolute().right_0().top_0().bottom_0().w(px(1.)).bg(edge))
                 .children(caret_x.map(|x| div().absolute().left(px(x)).top_0().h_full().w(px((1.5 * z).max(1.))).bg(col(WARN))))
                 .on_mouse_down(MouseButton::Left, cx.listener(move |t, e: &MouseDownEvent, _, cx| {
                     cx.stop_propagation();
-                    let col = fit + ((fl(e.position.x) - x0) / cw).round().max(0.) as usize;
+                    let col = fit + ((fl(e.position.x) - pane_x - x0) / cw).round().max(0.) as usize;
                     let Some(line) = t.shown_lines(id).and_then(|l| l.get(i)).cloned() else { return };
                     let ch = super::visual_to_chars(&line, col);
                     if t.editing == Some(id) {

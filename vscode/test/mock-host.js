@@ -12,6 +12,7 @@
   FILES['src/wide.ts'] = Array.from({ length: 40 }, (_, i) => i % 6 === 2
     ? `export const message${i} = format('this line is deliberately very long so that it runs past the right edge of its card: ${'x'.repeat(40)}', ${i});`
     : `export const v${i} = ${i};`).join('\n');
+  FILES['guix/hello.scm'] = ';;; A Guix package\n(define-module (hello)\n  #:use-module (guix packages))\n\n(define-public hello\n  (package\n    (name "hello")\n    (version "2.12")\n    (description "Prints a friendly greeting;\nnot much else.")\n    (arguments (list #:tests? #t))))\n';
   FILES['src/long.ts'] = Array.from({ length: 200 }, (_, i) => `export const v${i} = ${i}; // line ${i + 1}`).join('\n');
   const post = m => setTimeout(() => window.postMessage(m, '*'), 5);
   const log = (window.__hostLog = []);

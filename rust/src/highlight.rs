@@ -36,7 +36,7 @@ impl Spans {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Family { C, Hash, Dash, Plain }
+enum Family { C, Hash, Dash, Lisp, Plain }
 
 const KEYWORDS: &[&str] = &[
     "abstract","as","async","await","break","case","catch","class","const","continue","def","default","defer","del","delete","do","elif","else","elseif","end","enum","export","extends","extern","false","final","finally","fn","for","foreach","from","func","function","go","goto","if","impl","implements","import","in","include","interface","is","lambda","let","local","loop","match","mod","module","mut","namespace","new","nil","none","None","not","null","of","or","and","override","package","pass","private","protected","pub","public","raise","readonly","ref","repeat","require","return","self","Self","static","struct","super","switch","template","then","this","throw","trait","true","True","False","try","type","typedef","typeof","union","unsafe","until","use","using","var","virtual","void","volatile","where","while","with","yield",
@@ -45,16 +45,56 @@ const KEYWORDS: &[&str] = &[
 fn family(path: &str) -> Family {
     let ext = path.rsplit('/').next().unwrap_or(path).rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
     match ext.as_str() {
-        "py" | "rb" | "sh" | "yml" | "yaml" | "toml" | "ps1" | "r" | "pl" | "conf" | "ini" | "scm" => Family::Hash,
+        "py" | "rb" | "sh" | "yml" | "yaml" | "toml" | "ps1" | "r" | "pl" | "conf" | "ini" => Family::Hash,
+        "scm" | "ss" | "sls" | "sld" | "rkt" | "el" | "lisp" | "lsp" | "cl" | "clj" | "cljs" | "cljc" | "edn" | "fnl" | "janet" => Family::Lisp,
         "lua" | "sql" | "hs" => Family::Dash,
         "html" | "xml" | "svg" | "md" | "txt" | "csv" | "" => Family::Plain,
         _ => Family::C,
     }
 }
 
-/// Highlights every line; block comments carry across lines. Ranges are byte offsets on char boundaries.
+/// The languages a card can be set to: (name, file extension the highlighter goes by).
+pub const LANGS: &[(&str, &str)] = &[
+    ("Plain text", "txt"), ("C", "c"), ("C++", "cpp"), ("C#", "cs"), ("Go", "go"), ("Java", "java"), ("JavaScript", "js"),
+    ("TypeScript", "ts"), ("Rust", "rs"), ("Swift", "swift"), ("Kotlin", "kt"), ("Zig", "zig"), ("CSS", "css"), ("JSON", "json"),
+    ("Python", "py"), ("Ruby", "rb"), ("Shell", "sh"), ("PowerShell", "ps1"), ("Perl", "pl"), ("R", "r"), ("YAML", "yaml"),
+    ("TOML", "toml"), ("INI / config", "ini"), ("Lua", "lua"), ("SQL", "sql"), ("Haskell", "hs"), ("Scheme", "scm"),
+    ("Racket", "rkt"), ("Common Lisp", "lisp"), ("Emacs Lisp", "el"), ("Clojure", "clj"), ("Fennel", "fnl"),
+    ("HTML", "html"), ("XML", "xml"), ("Markdown", "md"),
+];
+
+/// The name of the language a path (or `x.ext`) is highlighted as.
+pub fn lang_name(path: &str) -> String {
+    let ext = path.rsplit('/').next().unwrap_or(path).rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    LANGS.iter().find(|(_, e)| *e == ext).map(|(n, _)| n.to_string()).unwrap_or_else(|| if ext.is_empty() { "Plain text".into() } else { ext.to_uppercase() })
+}
+
+/// What carries over from one line to the next.
+#[derive(Clone, Copy, PartialEq)]
+enum Carry { None, Block, Str }
+
+const LISP_KEYWORDS: &[&str] = &[
+    "define", "define*", "define-public", "define-module", "define-record-type", "define-syntax", "define-syntax-rule", "define-values",
+    "define-macro", "define-library", "lambda", "lambda*", "case-lambda", "let", "let*", "letrec", "letrec*", "let-values", "let*-values",
+    "let-syntax", "if", "cond", "case", "when", "unless", "else", "begin", "do", "and", "or", "not", "quote", "quasiquote", "unquote",
+    "set!", "syntax-rules", "syntax-case", "use-modules", "import", "export", "module", "library", "match", "match-lambda", "guard",
+    "parameterize", "delay", "force", "values", "receive", "inherit", "modify-phases", "add-after", "add-before", "replace", "delete",
+    "defun", "defmacro", "defvar", "defparameter", "defconst", "defcustom", "defn", "defn-", "def", "fn", "ns", "require", "setq",
+    "setf", "progn", "loop", "dolist", "dotimes", "flet", "labels", "while", "unwind-protect", "condition-case", "catch", "throw",
+];
+
+/// Highlights every line; block comments (and Lisp strings) carry across lines. Ranges are byte offsets on
+/// char boundaries.
 pub fn highlight(lines: &[String], path: &str) -> Spans {
     let fam = family(path);
+    let mut carry = Carry::None;
+    if fam == Family::Lisp {
+        let mut out = Spans { items: Vec::new(), starts: Vec::with_capacity(lines.len() + 1) };
+        out.starts.push(0);
+        for l in lines { out.push_line(lisp_line(l, &mut carry)); }
+        out.items.shrink_to_fit();
+        return out;
+    }
     let mut in_block = false;
     let mut out = Spans { items: Vec::new(), starts: Vec::with_capacity(lines.len() + 1) };
     out.starts.push(0);
@@ -123,12 +163,89 @@ fn line(s: &str, fam: Family, in_block: &mut bool) -> Vec<(Range<usize>, Tok)> {
     out
 }
 
+/// One line of a Lisp: `;` comments, `#| |#` block comments and strings that carry across lines, `#:keywords`,
+/// `#t`/`#f`, characters and numbers; special forms anywhere, and the head of a list as a call.
+fn lisp_line(s: &str, carry: &mut Carry) -> Vec<(Range<usize>, Tok)> {
+    let mut out = Vec::new();
+    if s.len() > 2000 { return out; }
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    // the closing quote of a string, from `from`, or None if it runs past the line
+    let str_end = |from: usize| { let mut j = from; while j < s.len() { match bytes[j] { b'\\' => j += 2, b'"' => return Some(j + 1), _ => j += 1 } } None };
+    match *carry {
+        Carry::Block => match s.find("|#") {
+            None => return vec![(0..s.len(), Tok::Comment)],
+            Some(e) => { out.push((0..e + 2, Tok::Comment)); i = e + 2; *carry = Carry::None; }
+        },
+        Carry::Str => match str_end(0) {
+            None => return vec![(0..s.len(), Tok::Str)],
+            Some(e) => { out.push((0..e, Tok::Str)); i = e; *carry = Carry::None; }
+        },
+        Carry::None => {}
+    }
+    let sym = |c: char| c.is_alphanumeric() || "-_!?*<>=/+.:%&^~$@".contains(c);
+    let mut head = false;
+    while i < s.len() {
+        let rest = &s[i..];
+        let c = rest.chars().next().unwrap();
+        if c == ';' { out.push((i..s.len(), Tok::Comment)); break; }
+        if rest.starts_with("#|") {
+            match rest[2..].find("|#") {
+                None => { out.push((i..s.len(), Tok::Comment)); *carry = Carry::Block; break; }
+                Some(e) => { let end = i + 2 + e + 2; out.push((i..end, Tok::Comment)); i = end; continue; }
+            }
+        }
+        if c == '"' {
+            match str_end(i + 1) {
+                None => { out.push((i..s.len(), Tok::Str)); *carry = Carry::Str; break; }
+                Some(end) => { out.push((i..end, Tok::Str)); i = end; head = false; continue; }
+            }
+        }
+        if c == '(' || c == '[' { head = true; i += 1; continue; }
+        if rest.starts_with("#:") || rest.starts_with("#\\") || ((rest.starts_with("#t") || rest.starts_with("#f")) && !rest[2..].starts_with(|ch: char| sym(ch))) {
+            let skip = if rest.starts_with("#\\") { 3.min(rest.len()) } else { 2 };
+            let end = i + skip + rest[skip..].find(|ch: char| !sym(ch)).unwrap_or(rest.len() - skip);
+            out.push((i..end, if rest.starts_with("#:") { Tok::Type } else { Tok::Num }));
+            i = end; head = false; continue;
+        }
+        if c.is_ascii_digit() || ((c == '-' || c == '+') && rest[1..].starts_with(|ch: char| ch.is_ascii_digit())) {
+            let end = i + 1 + rest[1..].find(|ch: char| !sym(ch)).unwrap_or(rest.len() - 1);
+            out.push((i..end, Tok::Num));
+            i = end; head = false; continue;
+        }
+        if c == '\'' && rest[1..].starts_with(|ch: char| sym(ch)) {
+            let end = i + 1 + rest[1..].find(|ch: char| !sym(ch)).unwrap_or(rest.len() - 1);
+            out.push((i..end, Tok::Type)); // a quoted symbol
+            i = end; head = false; continue;
+        }
+        if sym(c) {
+            let end = i + rest.find(|ch: char| !sym(ch)).unwrap_or(rest.len());
+            let word = &s[i..end];
+            if LISP_KEYWORDS.contains(&word) { out.push((i..end, Tok::Keyword)); }
+            else if head { out.push((i..end, Tok::Func)); }
+            i = end; head = false; continue;
+        }
+        if !c.is_whitespace() { head = false; }
+        i += c.len_utf8();
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     fn l(v: &[&str]) -> Vec<String> { v.iter().map(|s| s.to_string()).collect() }
     /// The runs of line `i` the way the tests spell them.
     fn at(h: &Spans, i: usize) -> Vec<(Range<usize>, Tok)> { h.line(i).unwrap().iter().map(|s| (s.range(), s.tok)).collect() }
+
+    #[test]
+    fn scheme_reads_as_scheme() {
+        let h = highlight(&l(&["(define-public (foo x) ; the foo", "  (string-append \"a;b", "c\" #:key #t 'sym 42))"]), "x.scm");
+        assert_eq!(at(&h, 0), vec![(1..14, Tok::Keyword), (16..19, Tok::Func), (23..32, Tok::Comment)]);
+        assert_eq!(at(&h, 1), vec![(3..16, Tok::Func), (17..21, Tok::Str)]);
+        assert_eq!(at(&h, 2), vec![(0..2, Tok::Str), (3..8, Tok::Type), (9..11, Tok::Num), (12..16, Tok::Type), (17..19, Tok::Num)]);
+        assert_eq!(lang_name("packages/foo.scm"), "Scheme");
+    }
 
     #[test]
     fn lua_uses_dash_comments() {
